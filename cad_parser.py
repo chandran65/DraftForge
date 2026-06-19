@@ -151,6 +151,14 @@ def project_3d_cad(file_path, output_svg_path, views=None):
                 cmd = [fc_bin, projector_script]
 
     if fc_bin:
+        # Check if running in the Streamlit Cloud sandbox.
+        # Streamlit Cloud mounts repositories under "/mount/src/".
+        # Running Xvfb/FreeCAD GUI inside Streamlit Cloud's container is restricted and times out.
+        if "mount/src" in os.path.abspath(__file__) or "mount/src" in os.getcwd():
+            logger.warning("Streamlit Cloud environment detected. Bypassing FreeCAD subprocess to avoid Xvfb sandbox timeout.")
+            fc_bin = None
+
+    if fc_bin:
         import json
         import subprocess
         
@@ -167,7 +175,7 @@ def project_3d_cad(file_path, output_svg_path, views=None):
                 
             logger.info(f"Spawning native FreeCAD GUI subprocess to project: {' '.join(cmd)}")
             
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
             
             # Clean up the JSON args file
             if os.path.exists(args_path):
