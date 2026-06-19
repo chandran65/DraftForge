@@ -583,14 +583,34 @@ def load_delta_expected_geometry(file_path, views):
         x1, y1, z1 = l[0]
         x2, y2, z2 = l[1]
         
+        # Check boundary limits
         if not (lim_min_x <= x1 <= lim_max_x and lim_min_x <= x2 <= lim_max_x and
                 lim_min_y <= y1 <= lim_max_y and lim_min_y <= y2 <= lim_max_y and
                 lim_min_z <= z1 <= lim_max_z and lim_min_z <= z2 <= lim_max_z):
             continue
             
+        # Filter clutter: skip short lines representing minor internal components
         length = math.sqrt((x2-x1)**2 + (y2-y1)**2 + (z2-z1)**2)
-        if length < diagonal * 0.02:  # slightly lowered to preserve arcs
+        if length < diagonal * 0.02:
             continue
+            
+        # Internal clutter filter: if a line is completely inside the interior 90% volume (5% margin) of the model,
+        # it is an internal part (e.g. coils, boards, rotor) and should be filtered out to avoid wireframe mess
+        if model_w > 0 and model_h > 0 and model_d > 0:
+            int_x = model_w * 0.05
+            int_y = model_h * 0.05
+            int_z = model_d * 0.05
+            
+            is_internal_1 = (p2_x + int_x <= x1 <= p98_x - int_x and
+                             p2_y + int_y <= y1 <= p98_y - int_y and
+                             p2_z + int_z <= z1 <= p98_z - int_z)
+                             
+            is_internal_2 = (p2_x + int_x <= x2 <= p98_x - int_x and
+                             p2_y + int_y <= y2 <= p98_y - int_y and
+                             p2_z + int_z <= z2 <= p98_z - int_z)
+                             
+            if is_internal_1 and is_internal_2:
+                continue
             
         filtered_lines_3d.append(l)
         
