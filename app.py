@@ -4,7 +4,7 @@ import tempfile
 import streamlit as st
 import streamlit.components.v1 as components
 
-# Add local path import context
+# Add local path import context and setup
 import importlib
 import cad_parser
 import pdf_parser
