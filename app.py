@@ -5,6 +5,16 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # Add local path import context
+import importlib
+import cad_parser
+import pdf_parser
+import renderer
+
+# Force reload helper modules to bypass Streamlit's in-memory import cache
+importlib.reload(cad_parser)
+importlib.reload(pdf_parser)
+importlib.reload(renderer)
+
 from cad_parser import project_3d_cad
 from pdf_parser import parse_drawing
 from renderer import render_pipeline_output, THEMES
