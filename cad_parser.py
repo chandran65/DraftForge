@@ -372,7 +372,7 @@ def load_delta_expected_geometry(file_path, views):
     """
     Natively parses the 3D IGES file directly, extracts all 3D line entities,
     and performs a mathematical 3D-to-2D projection to Top, Front, and Side views.
-    This provides a 100% native CAD projection constructed directly from the .igs file!
+    This is fully general-purpose, scalable, and dynamically filters out detail clutter.
     """
     logger.info(f"Parsing 3D CAD model directly: {file_path}")
     filename = os.path.basename(file_path)
@@ -406,8 +406,6 @@ def load_delta_expected_geometry(file_path, views):
         logger.warning("No native 3D line entities (110) found in Directory section.")
         return None
         
-    logger.info(f"Found {len(p_pointers)} line entity pointers in Directory Entry section.")
-    
     # 2. Second pass: Parse coordinate details from Parameter (P) section
     lines_3d = []
     with open(file_path, "r", errors="ignore") as f:
@@ -417,13 +415,10 @@ def load_delta_expected_geometry(file_path, views):
             section = line[72]
             if section != 'P':
                 continue
-                
-            # Parameter line points to Directory index in columns 74-80 (last 7 chars after 'P')
             try:
                 line_no = int(line[73:80].strip())
             except ValueError:
                 continue
-                
             if line_no in p_pointers:
                 # Parse coordinates: "110, X1, Y1, Z1, X2, Y2, Z2;"
                 content = line[0:64].strip()
@@ -442,145 +437,10 @@ def load_delta_expected_geometry(file_path, views):
                     except ValueError:
                         continue
                         
-    logger.info(f"Successfully extracted {len(lines_3d)} native 3D line elements directly from CAD model!")
-    
     if not lines_3d:
         return None
         
-    # Subsample/decimate if there are too many lines to keep rendering fast and clean
-    max_lines = 1500
-    if len(lines_3d) > max_lines:
-        step = len(lines_3d) // max_lines
-        lines_3d = lines_3d[::step]
-        logger.info(f"Subsampled wireframe to {len(lines_3d)} lines for clean rendering performance.")
-        
-    # 3. Perform mathematical 3D-to-2D projection
-    top_group = []
-    front_group = []
-    side_group = []
-    
-    for i, line_3d in enumerate(lines_3d):
-        (x1, y1, z1), (x2, y2, z2) = line_3d
-        
-        # Stylize centerlines / hidden lines to match premium engineering drafting
-        style = "visible"
-        if i % 15 == 0:
-            style = "center"
-        elif i % 10 == 0:
-            style = "hidden"
-            
-        top_group.append({
-            "start": (x1, y1),
-            "end": (x2, y2),
-            "style": style
-        })
-        front_group.append({
-            "start": (x1, z1),
-            "end": (x2, z2),
-            "style": style
-        })
-        side_group.append({
-            "start": (y1, z1),
-            "end": (y2, z2),
-            "style": style
-        })
-        
-    # 4. Standard drawing layout
-    geometry_data = {
-        "source": "cad_iges_native",
-        "file_name": os.path.basename(file_path),
-        "views": {},
-        "width": 297,
-        "height": 210
-    }
-    
-    # Helper to fit, center, and scale lines into view limits
-    def fit_lines(lines_group, target_center, max_size=65):
-        if not lines_group:
-            return []
-            
-        # Extract all endpoint coordinates to analyze distribution
-        xs = []
-        ys = []
-        for l in lines_group:
-            xs.extend([l["start"][0], l["end"][0]])
-            ys.extend([l["start"][1], l["end"][1]])
-            
-        if not xs:
-            return []
-            
-        # Sort coordinates to find percentiles
-        xs_sorted = sorted(xs)
-        ys_sorted = sorted(ys)
-        n = len(xs_sorted)
-        
-        # Use 2nd and 98th percentiles to define a robust bounding box,
-        # ignoring extreme outliers (like datum planes or origin marks at 0,0,0)
-        p2_x = xs_sorted[int(n * 0.02)]
-        p98_x = xs_sorted[int(n * 0.98)]
-        p2_y = ys_sorted[int(n * 0.02)]
-        p98_y = ys_sorted[int(n * 0.98)]
-        
-        # Add a 10% padding to the robust bounding box
-        rx_w = p98_x - p2_x
-        ry_h = p98_y - p2_y
-        
-        margin_x = rx_w * 0.1 if rx_w > 0 else 1.0
-        margin_y = ry_h * 0.1 if ry_h > 0 else 1.0
-        
-        limit_min_x = p2_x - margin_x
-        limit_max_x = p98_x + margin_x
-        limit_min_y = p2_y - margin_y
-        limit_max_y = p98_y + margin_y
-        
-        # Filter lines that fall within this robust bounding box
-        valid_lines = []
-        for l in lines_group:
-            x1, y1 = l["start"]
-            x2, y2 = l["end"]
-            if (limit_min_x <= x1 <= limit_max_x and limit_min_x <= x2 <= limit_max_x and
-                limit_min_y <= y1 <= limit_max_y and limit_min_y <= y2 <= limit_max_y):
-                valid_lines.append(l)
-                
-        # If filtering left us with nothing, fall back to the original list
-        if not valid_lines:
-            valid_lines = lines_group
-            
-        # Recompute bounding box of valid lines for scaling
-        v_xs = []
-        v_ys = []
-        for l in valid_lines:
-            v_xs.extend([l["start"][0], l["end"][0]])
-            v_ys.extend([l["start"][1], l["end"][1]])
-            
-        min_x, max_x = min(v_xs), max(v_xs)
-        min_y, max_y = min(v_ys), max(v_ys)
-        
-        w_box = max_x - min_x
-        h_box = max_y - min_y
-        
-        cx = min_x + w_box / 2
-        cy = min_y + h_box / 2
-        
-        curr_max = max(w_box, h_box)
-        scale = max_size / curr_max if curr_max > 0 else 1.0
-        
-        fitted = []
-        for l in valid_lines:
-            x1 = target_center[0] + (l["start"][0] - cx) * scale
-            y1 = target_center[1] + (l["start"][1] - cy) * scale
-            x2 = target_center[0] + (l["end"][0] - cx) * scale
-            y2 = target_center[1] + (l["end"][1] - cy) * scale
-            
-            fitted.append({
-                "start": (x1, y1),
-                "end": (x2, y2),
-                "style": l["style"]
-            })
-        return fitted
-
-    # Map groups to requested views
-    # Calculate robust model dimensions based on 3D endpoints distribution
+    # 3. Calculate robust model dimensions based on 3D endpoints distribution (ignoring datum/axis outliers)
     xs_all = []
     ys_all = []
     zs_all = []
@@ -590,72 +450,175 @@ def load_delta_expected_geometry(file_path, views):
         zs_all.extend([l[0][2], l[1][2]])
         
     n_all = len(xs_all)
-    if n_all > 4:
-        xs_all_sorted = sorted(xs_all)
-        ys_all_sorted = sorted(ys_all)
-        zs_all_sorted = sorted(zs_all)
+    xs_all_sorted = sorted(xs_all)
+    ys_all_sorted = sorted(ys_all)
+    zs_all_sorted = sorted(zs_all)
+    
+    p2_x = xs_all_sorted[int(n_all * 0.02)]
+    p98_x = xs_all_sorted[int(n_all * 0.98)]
+    p2_y = ys_all_sorted[int(n_all * 0.02)]
+    p98_y = ys_all_sorted[int(n_all * 0.98)]
+    p2_z = zs_all_sorted[int(n_all * 0.02)]
+    p98_z = zs_all_sorted[int(n_all * 0.98)]
+    
+    model_w = abs(p98_x - p2_x)
+    model_h = abs(p98_y - p2_y)
+    model_d = abs(p98_z - p2_z)
+    
+    # Bounding box diagonal for detail/clutter filtering
+    diagonal = math.sqrt(model_w**2 + model_h**2 + model_d**2)
+    
+    # Filter lines: ignore extreme outliers and short internal details (lines < 3% of diagonal)
+    filtered_lines_3d = []
+    margin_x = model_w * 0.1 if model_w > 0 else 1.0
+    margin_y = model_h * 0.1 if model_h > 0 else 1.0
+    margin_z = model_d * 0.1 if model_d > 0 else 1.0
+    
+    lim_min_x, lim_max_x = p2_x - margin_x, p98_x + margin_x
+    lim_min_y, lim_max_y = p2_y - margin_y, p98_y + margin_y
+    lim_min_z, lim_max_z = p2_z - margin_z, p98_z + margin_z
+    
+    for l in lines_3d:
+        x1, y1, z1 = l[0]
+        x2, y2, z2 = l[1]
         
-        # Robust 2% to 98% percentile values
-        p2_x = xs_all_sorted[int(n_all * 0.02)]
-        p98_x = xs_all_sorted[int(n_all * 0.98)]
-        p2_y = ys_all_sorted[int(n_all * 0.02)]
-        p98_y = ys_all_sorted[int(n_all * 0.98)]
-        p2_z = zs_all_sorted[int(n_all * 0.02)]
-        p98_z = zs_all_sorted[int(n_all * 0.98)]
+        # Check boundary limits
+        if not (lim_min_x <= x1 <= lim_max_x and lim_min_x <= x2 <= lim_max_x and
+                lim_min_y <= y1 <= lim_max_y and lim_min_y <= y2 <= lim_max_y and
+                lim_min_z <= z1 <= lim_max_z and lim_min_z <= z2 <= lim_max_z):
+            continue
+            
+        # Filter clutter: skip short lines representing minor internal components (circuits, vents, screws)
+        length = math.sqrt((x2-x1)**2 + (y2-y1)**2 + (z2-z1)**2)
+        if length < diagonal * 0.03:
+            continue
+            
+        filtered_lines_3d.append(l)
         
-        model_w = abs(p98_x - p2_x)
-        model_h = abs(p98_y - p2_y)
-        model_d = abs(p98_z - p2_z)
-    else:
-        model_w, model_h, model_d = 120.0, 95.0, 240.0 # Standard fallback values
+    if not filtered_lines_3d:
+        filtered_lines_3d = lines_3d
         
-    # Format dimensions nicely
+    # Recompute clean model bounds for layout dimensioning
+    xs_clean = []
+    ys_clean = []
+    zs_clean = []
+    for l in filtered_lines_3d:
+        xs_clean.extend([l[0][0], l[1][0]])
+        ys_clean.extend([l[0][1], l[1][1]])
+        zs_clean.extend([l[0][2], l[1][2]])
+        
+    min_x, max_x = min(xs_clean), max(xs_clean)
+    min_y, max_y = min(ys_clean), max(ys_clean)
+    min_z, max_z = min(zs_clean), max(zs_clean)
+    
+    model_w = max_x - min_x
+    model_h = max_y - min_y
+    model_d = max_z - min_z
+    
+    # 4. Perform orthographic 3D-to-2D projection
+    top_group = []
+    front_group = []
+    side_group = []
+    
+    for i, line_3d in enumerate(filtered_lines_3d):
+        (x1, y1, z1), (x2, y2, z2) = line_3d
+        
+        style = "visible"
+        if i % 15 == 0:
+            style = "center"
+        elif i % 10 == 0:
+            style = "hidden"
+            
+        top_group.append({"start": (x1, y1), "end": (x2, y2), "style": style})
+        front_group.append({"start": (x1, z1), "end": (x2, z2), "style": style})
+        side_group.append({"start": (y1, z1), "end": (y2, z2), "style": style})
+        
+    # 5. Standard Drawing Layout
+    geometry_data = {
+        "source": "cad_iges_native",
+        "file_name": filename,
+        "views": {},
+        "width": 297,
+        "height": 210
+    }
+    
+    # Centered spaced coordinates on the A4 page to prevent any overlaps
+    tx, ty = 80, 60
+    fx, fy = 200, 60
+    sx, sy = 80, 155
+    
+    # Helper to fit, center, and scale lines into view limits dynamically
+    def fit_lines(lines_group, target_center, max_size=65):
+        if not lines_group:
+            return [], 0, 0
+        l_xs = []
+        l_ys = []
+        for l in lines_group:
+            l_xs.extend([l["start"][0], l["end"][0]])
+            l_ys.extend([l["start"][1], l["end"][1]])
+        mx_min, mx_max = min(l_xs), max(l_xs)
+        my_min, my_max = min(l_ys), max(l_ys)
+        w_box, h_box = mx_max - mx_min, my_max - my_min
+        cx = mx_min + w_box / 2
+        cy = my_min + h_box / 2
+        curr_max = max(w_box, h_box)
+        scale = max_size / curr_max if curr_max > 0 else 1.0
+        
+        fitted = []
+        for l in lines_group:
+            x1 = target_center[0] + (l["start"][0] - cx) * scale
+            y1 = target_center[1] + (l["start"][1] - cy) * scale
+            x2 = target_center[0] + (l["end"][0] - cx) * scale
+            y2 = target_center[1] + (l["end"][1] - cy) * scale
+            fitted.append({"start": (x1, y1), "end": (x2, y2), "style": l["style"]})
+        return fitted, w_box * scale, h_box * scale
+
     dim_w = f"{model_w:.2f}"
     dim_h = f"{model_h:.2f}"
     dim_d = f"{model_d:.2f}"
 
     if 'top' in views and top_group:
-        tx, ty = 80, 60
+        fitted, w_fit, h_fit = fit_lines(top_group, (tx, ty), max_size=50)
         geometry_data["views"]["top"] = {
             "title": "TOP VIEW (SECTIONAL)",
             "center": (tx, ty),
-            "lines": fit_lines(top_group, (tx, ty), max_size=50),
+            "lines": fitted,
             "circles": [],
             "bolt_holes": [],
             "dimensions": [
-                {"start": (tx - 25, ty + 25), "end": (tx + 25, ty + 25), "text": dim_w, "offset": 10},
-                {"start": (tx + 25, ty - 25), "end": (tx + 25, ty + 25), "text": dim_h, "offset": 10}
+                {"start": (tx - w_fit/2, ty + h_fit/2 + 10), "end": (tx + w_fit/2, ty + h_fit/2 + 10), "text": dim_w, "offset": 0},
+                {"start": (tx + w_fit/2 + 10, ty - h_fit/2), "end": (tx + w_fit/2 + 10, ty + h_fit/2), "text": dim_h, "offset": 0}
             ]
         }
         
     if 'front' in views and front_group:
-        fx, fy = 200, 60
+        fitted, w_fit, h_fit = fit_lines(front_group, (fx, fy), max_size=60)
         geometry_data["views"]["front"] = {
             "title": "FRONT VIEW (ORTHOGRAPHIC)",
             "center": (fx, fy),
-            "lines": fit_lines(front_group, (fx, fy), max_size=60),
+            "lines": fitted,
             "circles": [],
             "bolt_holes": [],
             "dimensions": [
-                {"start": (fx - 30, fy + 30), "end": (fx + 30, fy + 30), "text": dim_w, "offset": 12},
-                {"start": (fx + 30, fy - 30), "end": (fx + 30, fy + 30), "text": dim_d, "offset": 12}
+                {"start": (fx - w_fit/2, fy + h_fit/2 + 12), "end": (fx + w_fit/2, fy + h_fit/2 + 12), "text": dim_w, "offset": 0},
+                {"start": (fx + w_fit/2 + 12, fy - h_fit/2), "end": (fx + w_fit/2 + 12, fy + h_fit/2), "text": dim_d, "offset": 0}
             ]
         }
         
     if 'side' in views and side_group:
-        sx, sy = 80, 155
+        fitted, w_fit, h_fit = fit_lines(side_group, (sx, sy), max_size=50)
         geometry_data["views"]["side"] = {
             "title": "SIDE VIEW (PROFILE)",
             "center": (sx, sy),
-            "lines": fit_lines(side_group, (sx, sy), max_size=50),
+            "lines": fitted,
             "circles": [],
             "bolt_holes": [],
             "dimensions": [
-                {"start": (sx - 25, sy - 25), "end": (sx + 25, sy - 25), "text": f"{dim_h} (DEPTH)", "offset": -10}
+                {"start": (sx - w_fit/2, sy - h_fit/2 - 10), "end": (sx + w_fit/2, sy - h_fit/2 - 10), "text": f"{dim_h} (DEPTH)", "offset": 0}
             ]
         }
         
-    logger.info(f"Successfully constructed {len(lines_3d)} projected lines into views: {list(geometry_data['views'].keys())}")
+    logger.info(f"Successfully constructed {len(filtered_lines_3d)} projected lines into views: {list(geometry_data['views'].keys())}")
     return geometry_data
 
 def generate_mock_cad_geometry(file_path, views):
