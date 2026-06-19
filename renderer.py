@@ -150,7 +150,7 @@ def render_pipeline_output(geometry_data, output_base_path, theme_name="dark"):
             view_group = dwg.g(id=f"view-{view_name}")
             
             # View titles
-            title_pos = (view["center"][0], view["center"][1] - 48)
+            title_pos = (view["center"][0], view["center"][1] - 35)
             view_group.add(dwg.text(view["title"], insert=title_pos, font_size=4.0, fill=theme["text"], font_weight="bold", text_anchor="middle", font_family="Inter, sans-serif"))
             
             # Draw lines
@@ -438,7 +438,7 @@ def compile_pdf(geometry_data, svg_path, pdf_path, theme):
                     c.setFont("Helvetica-Bold", 4.0 * pt)
                     # Title
                     title_x = view["center"][0] * pt
-                    title_y = h_pt - (view["center"][1] - 48) * pt
+                    title_y = h_pt - (view["center"][1] - 35) * pt
                     c.drawCentredString(title_x, title_y, view["title"])
                     
                     # Draw bolt holes (ReportLab)

@@ -420,8 +420,42 @@ def load_delta_expected_geometry(file_path, views):
         return fitted
 
     # Map groups to requested views
+    # Calculate robust model dimensions based on 3D endpoints distribution
+    xs_all = []
+    ys_all = []
+    zs_all = []
+    for l in lines_3d:
+        xs_all.extend([l[0][0], l[1][0]])
+        ys_all.extend([l[0][1], l[1][1]])
+        zs_all.extend([l[0][2], l[1][2]])
+        
+    n_all = len(xs_all)
+    if n_all > 4:
+        xs_all_sorted = sorted(xs_all)
+        ys_all_sorted = sorted(ys_all)
+        zs_all_sorted = sorted(zs_all)
+        
+        # Robust 2% to 98% percentile values
+        p2_x = xs_all_sorted[int(n_all * 0.02)]
+        p98_x = xs_all_sorted[int(n_all * 0.98)]
+        p2_y = ys_all_sorted[int(n_all * 0.02)]
+        p98_y = ys_all_sorted[int(n_all * 0.98)]
+        p2_z = zs_all_sorted[int(n_all * 0.02)]
+        p98_z = zs_all_sorted[int(n_all * 0.98)]
+        
+        model_w = abs(p98_x - p2_x)
+        model_h = abs(p98_y - p2_y)
+        model_d = abs(p98_z - p2_z)
+    else:
+        model_w, model_h, model_d = 120.0, 95.0, 240.0 # Standard fallback values
+        
+    # Format dimensions nicely
+    dim_w = f"{model_w:.2f}"
+    dim_h = f"{model_h:.2f}"
+    dim_d = f"{model_d:.2f}"
+
     if 'top' in views and top_group:
-        tx, ty = 80, 70
+        tx, ty = 80, 60
         geometry_data["views"]["top"] = {
             "title": "TOP VIEW (SECTIONAL)",
             "center": (tx, ty),
@@ -429,13 +463,13 @@ def load_delta_expected_geometry(file_path, views):
             "circles": [],
             "bolt_holes": [],
             "dimensions": [
-                {"start": (tx - 25, ty + 25), "end": (tx + 25, ty + 25), "text": "130.00", "offset": 10},
-                {"start": (tx + 25, ty - 25), "end": (tx + 25, ty + 25), "text": "120.00", "offset": 10}
+                {"start": (tx - 25, ty + 25), "end": (tx + 25, ty + 25), "text": dim_w, "offset": 10},
+                {"start": (tx + 25, ty - 25), "end": (tx + 25, ty + 25), "text": dim_h, "offset": 10}
             ]
         }
         
     if 'front' in views and front_group:
-        fx, fy = 200, 70
+        fx, fy = 200, 60
         geometry_data["views"]["front"] = {
             "title": "FRONT VIEW (ORTHOGRAPHIC)",
             "center": (fx, fy),
@@ -443,13 +477,13 @@ def load_delta_expected_geometry(file_path, views):
             "circles": [],
             "bolt_holes": [],
             "dimensions": [
-                {"start": (fx - 30, fy + 30), "end": (fx + 30, fy + 30), "text": "180.00", "offset": 12},
-                {"start": (fx + 30, fy - 30), "end": (fx + 30, fy + 30), "text": "240.00", "offset": 12}
+                {"start": (fx - 30, fy + 30), "end": (fx + 30, fy + 30), "text": dim_w, "offset": 12},
+                {"start": (fx + 30, fy - 30), "end": (fx + 30, fy + 30), "text": dim_d, "offset": 12}
             ]
         }
         
     if 'side' in views and side_group:
-        sx, sy = 80, 150
+        sx, sy = 80, 155
         geometry_data["views"]["side"] = {
             "title": "SIDE VIEW (PROFILE)",
             "center": (sx, sy),
@@ -457,7 +491,7 @@ def load_delta_expected_geometry(file_path, views):
             "circles": [],
             "bolt_holes": [],
             "dimensions": [
-                {"start": (sx - 25, sy - 25), "end": (sx + 25, sy - 25), "text": "95.00 SQ", "offset": -10}
+                {"start": (sx - 25, sy - 25), "end": (sx + 25, sy - 25), "text": f"{dim_h} (DEPTH)", "offset": -10}
             ]
         }
         
