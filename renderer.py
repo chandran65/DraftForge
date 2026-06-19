@@ -60,6 +60,22 @@ def render_pipeline_output(geometry_data, output_base_path, theme_name="dark"):
     svg_path = f"{output_base_path}.svg"
     pdf_path = f"{output_base_path}.pdf"
     
+    if geometry_data.get("source") == "cad_freecad":
+        logger.info("Found native FreeCAD geometry. Keeping already generated SVG & PDF outputs.")
+        png_path = f"{output_base_path}.png"
+        try:
+            import pypdfium2 as pdfium
+            logger.info(f"Natively rendering high-resolution PNG using pypdfium2 from {pdf_path}...")
+            doc = pdfium.PdfDocument(pdf_path)
+            page = doc[0]
+            bitmap = page.render(scale=5)
+            pil_img = bitmap.to_pil()
+            pil_img.save(png_path, "PNG")
+            logger.info(f"PNG drawing successfully compiled at: {png_path}")
+        except Exception as png_err:
+            logger.warning(f"Optional PNG compilation skipped: {png_err}")
+        return svg_path, pdf_path
+
     logger.info(f"Rendering vector drawing. Theme: '{theme_name}' -> '{svg_path}'")
     
     try:
@@ -424,6 +440,121 @@ def compile_pdf(geometry_data, svg_path, pdf_path, theme):
                     title_x = view["center"][0] * pt
                     title_y = h_pt - (view["center"][1] - 48) * pt
                     c.drawCentredString(title_x, title_y, view["title"])
+                    
+                    # Draw bolt holes (ReportLab)
+                    for hole in view.get("bolt_holes", []):
+                        c.setStrokeColor(theme["bolt"])
+                        c.setLineWidth(0.8)
+                        c.setDash([])
+                        hc_x, hc_y = hole["center"][0] * pt, h_pt - hole["center"][1] * pt
+                        hr = hole["radius"] * pt
+                        c.circle(hc_x, hc_y, hr, stroke=True, fill=False)
+                        
+                        # Add crosshairs
+                        c.setStrokeColor(theme["center"])
+                        c.setLineWidth(0.3)
+                        c.line(hc_x - hr - 2*pt, hc_y, hc_x + hr + 2*pt, hc_y)
+                        c.line(hc_x, hc_y - hr - 2*pt, hc_x, hc_y + hr + 2*pt)
+                        
+                    # Draw dimensions (ReportLab)
+                    for dim in view.get("dimensions", []):
+                        p1, p2 = dim["start"], dim["end"]
+                        text = dim["text"]
+                        offset = dim.get("offset", 15)
+                        
+                        dx = p2[0] - p1[0]
+                        dy = p2[1] - p1[1]
+                        angle = math.atan2(dy, dx)
+                        
+                        ox = -math.sin(angle) * offset
+                        oy = math.cos(angle) * offset
+                        
+                        p1_x, p1_y = p1[0] * pt, h_pt - p1[1] * pt
+                        p2_x, p2_y = p2[0] * pt, h_pt - p2[1] * pt
+                        
+                        ox_pt = ox * pt
+                        oy_pt = -oy * pt  # Y is inverted in ReportLab vs SVG
+                        
+                        dp1_x, dp1_y = p1_x + ox_pt, p1_y + oy_pt
+                        dp2_x, dp2_y = p2_x + ox_pt, p2_y + oy_pt
+                        
+                        # Extension lines (dashed)
+                        c.setStrokeColor(theme["border"])
+                        c.setLineWidth(0.4)
+                        c.setDash([2*pt, 2*pt])
+                        c.line(p1_x + ox_pt * 0.1, p1_y + oy_pt * 0.1, dp1_x + ox_pt * 0.15, dp1_y + oy_pt * 0.15)
+                        c.line(p2_x + ox_pt * 0.1, p2_y + oy_pt * 0.1, dp2_x + ox_pt * 0.15, dp2_y + oy_pt * 0.15)
+                        
+                        # Core dimension line
+                        c.setStrokeColor(theme["dimension"])
+                        c.setLineWidth(0.6)
+                        c.setDash([])
+                        c.line(dp1_x, dp1_y, dp2_x, dp2_y)
+                        
+                        # Arrowheads
+                        arrow_len = 3.5 * pt
+                        arrow_w = 1.0 * pt
+                        
+                        def draw_rl_arrowhead(tip_x, tip_y, is_start):
+                            d_len = math.hypot(dp2_x - dp1_x, dp2_y - dp1_y)
+                            if d_len > 0:
+                                u_x = (dp2_x - dp1_x) / d_len
+                                u_y = (dp2_y - dp1_y) / d_len
+                            else:
+                                u_x, u_y = 1, 0
+                                
+                            v_x = -u_y
+                            v_y = u_x
+                            
+                            factor = -1 if is_start else 1
+                            back_x = tip_x - factor * arrow_len * u_x
+                            back_y = tip_y - factor * arrow_len * u_y
+                            
+                            p_left_x = back_x - arrow_w * v_x
+                            p_left_y = back_y - arrow_w * v_y
+                            p_right_x = back_x + arrow_w * v_x
+                            p_right_y = back_y + arrow_w * v_y
+                            
+                            path = c.beginPath()
+                            path.moveTo(tip_x, tip_y)
+                            path.lineTo(p_left_x, p_left_y)
+                            path.lineTo(p_right_x, p_right_y)
+                            path.close()
+                            c.setFillColor(theme["dimension"])
+                            c.drawPath(path, fill=True, stroke=False)
+                            
+                        draw_rl_arrowhead(dp1_x, dp1_y, is_start=True)
+                        draw_rl_arrowhead(dp2_x, dp2_y, is_start=False)
+                        
+                        # Text annotation
+                        tx = (dp1_x + dp2_x) / 2
+                        ty = (dp1_y + dp2_y) / 2
+                        
+                        d_len = math.hypot(dp2_x - dp1_x, dp2_y - dp1_y)
+                        if d_len > 0:
+                            v_x = -(dp2_y - dp1_y) / d_len
+                            v_y = (dp2_x - dp1_x) / d_len
+                        else:
+                            v_x, v_y = 0, 1
+                            
+                        tx += v_x * 2.5 * pt * (1.0 if offset >= 0 else -1.0)
+                        ty += v_y * 2.5 * pt * (1.0 if offset >= 0 else -1.0)
+                        
+                        c.setFillColor(theme["text"])
+                        c.setFont("Helvetica", 3.0 * pt)
+                        
+                        # Rotate text to match line angle
+                        text_rot = math.degrees(math.atan2(dp2_y - dp1_y, dp2_x - dp1_x))
+                        if text_rot > 90:
+                            text_rot -= 180
+                        elif text_rot < -90:
+                            text_rot += 180
+                            
+                        c.saveState()
+                        c.translate(tx, ty)
+                        c.rotate(text_rot)
+                        c.drawCentredString(0, -1.0 * pt, text)
+                        c.restoreState()
                     
             else:
                 # Single drawing mode lines
