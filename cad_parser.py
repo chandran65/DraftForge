@@ -116,99 +116,172 @@ def is_svg_drawing_empty(svg_path):
         # On XML parsing error, return True to trigger fallback
         return True
 
+def fit_and_scale_geometries(lines_group, circles_group, bolt_holes_group, target_center, max_size=60):
+    """
+    Fit and scale all lines, circles, and bolt holes uniformly inside a view bounding box.
+    """
+    pts = []
+    for l in lines_group:
+        pts.append(l["start"])
+        pts.append(l["end"])
+    for c in circles_group:
+        cx, cy = c["center"]
+        r = c["radius"]
+        pts.append((cx - r, cy - r))
+        pts.append((cx + r, cy + r))
+    for bh in bolt_holes_group:
+        cx, cy = bh["center"]
+        r = bh["radius"]
+        pts.append((cx - r, cy - r))
+        pts.append((cx + r, cy + r))
+        
+    if not pts:
+        return [], [], [], 0, 0
+        
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    
+    w_box = max_x - min_x
+    h_box = max_y - min_y
+    cx = min_x + w_box / 2
+    cy = min_y + h_box / 2
+    
+    curr_max = max(w_box, h_box)
+    scale = max_size / curr_max if curr_max > 0 else 1.0
+    
+    fitted_lines = []
+    for l in lines_group:
+        x1 = target_center[0] + (l["start"][0] - cx) * scale
+        y1 = target_center[1] + (l["start"][1] - cy) * scale
+        x2 = target_center[0] + (l["end"][0] - cx) * scale
+        y2 = target_center[1] + (l["end"][1] - cy) * scale
+        fitted_lines.append({
+            "start": (x1, y1),
+            "end": (x2, y2),
+            "style": l["style"]
+        })
+        
+    fitted_circles = []
+    for c in circles_group:
+        x = target_center[0] + (c["center"][0] - cx) * scale
+        y = target_center[1] + (c["center"][1] - cy) * scale
+        fitted_circles.append({
+            "center": (x, y),
+            "radius": c["radius"] * scale,
+            "style": c["style"]
+        })
+        
+    fitted_bolt_holes = []
+    for bh in bolt_holes_group:
+        x = target_center[0] + (bh["center"][0] - cx) * scale
+        y = target_center[1] + (bh["center"][1] - cy) * scale
+        fitted_bolt_holes.append({
+            "center": (x, y),
+            "radius": bh["radius"] * scale,
+            "style": bh["style"]
+        })
+        
+    return fitted_lines, fitted_circles, fitted_bolt_holes, w_box * scale, h_box * scale
+
+
+def project_3d_cad_in_process(file_path, views):
+    """
+    Spawns a subprocess to project the 3D CAD model in console mode (headless)
+    and loads the resulting geometry JSON metadata.
+    This protects the parent process from C++ segfaults on corrupt files.
+    """
+    import subprocess
+    import json
+    
+    logger.info(f"Isolated headless projection subprocess for {file_path}")
+    
+    # We will write temporary args.json and output paths
+    out_dir = os.path.dirname(os.path.abspath(file_path))
+    temp_out_base = os.path.join(out_dir, "headless_tmp")
+    result_json_path = temp_out_base + "_result.json"
+    
+    # Clean up old temporary files if they exist
+    if os.path.exists(result_json_path):
+        try:
+            os.remove(result_json_path)
+        except Exception:
+            pass
+            
+    args_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'freecad_args.json')
+    config = {
+        "input_file": os.path.abspath(file_path),
+        "output_file": temp_out_base,
+        "views": views
+    }
+    
+    # Standard python executable running this script
+    py_exec = sys.executable
+    
+    # If running inside Streamlit which uses custom FreeCAD resources
+    # verify if a custom python is packaged with FreeCAD
+    if sys.platform == "darwin":
+        fc_py = "/Applications/FreeCAD.app/Contents/Resources/bin/python"
+        if os.path.exists(fc_py):
+            py_exec = fc_py
+            
+    projector_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "freecad_projector_headless.py")
+    
+    cmd = [py_exec, projector_script]
+    
+    try:
+        with open(args_path, 'w') as f:
+            json.dump(config, f, indent=2)
+            
+        logger.info(f"Executing: {' '.join(cmd)}")
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        
+        # Check result
+        if res.returncode != 0 or not os.path.exists(result_json_path):
+            raise RuntimeError(
+                f"Subprocess projection failed (exit code: {res.returncode}). "
+                f"Stdout: {res.stdout}. Stderr: {res.stderr}"
+            )
+            
+        with open(result_json_path, 'r') as f_res:
+            geometry_data = json.load(f_res)
+            
+        logger.info("Headless projection completed successfully!")
+        return geometry_data
+        
+    finally:
+        # Cleanup
+        if os.path.exists(args_path):
+            try:
+                os.remove(args_path)
+            except Exception:
+                pass
+        if os.path.exists(result_json_path):
+            try:
+                os.remove(result_json_path)
+            except Exception:
+                pass
+
+
+
 def project_3d_cad(file_path, output_svg_path, views=None):
     """
     Project 3D views (top, front, side) of a STEP/IGS file to 2D SVG vector representation.
-    Natively runs FreeCAD GUI inside a subprocess to export the drawing.
-    If FreeCAD is missing or fails, falls back to generating high-fidelity mock CAD geometry.
+    If FreeCAD is available, runs in-process headless projection.
+    Otherwise, falls back to generating high-fidelity mock CAD geometry.
     """
     if views is None:
         views = ['top', 'front', 'side']
         
     logger.info(f"Processing 3D CAD file: '{file_path}' (views: {views})")
     
-    import sys
-    import shutil
-
-    # Determine command based on platform and FreeCAD availability
-    fc_bin = None
-    cmd = []
-    projector_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "freecad_projector.py")
-
-    if sys.platform == "darwin":  # macOS
-        fc_bin_mac = "/Applications/FreeCAD.app/Contents/MacOS/FreeCAD"
-        if os.path.exists(fc_bin_mac):
-            fc_bin = fc_bin_mac
-            cmd = [fc_bin, projector_script]
-    elif sys.platform.startswith("linux"):  # Linux (Docker / Server)
-        freecad_path = shutil.which("freecad")
-        if freecad_path:
-            fc_bin = freecad_path
-            xvfb_path = shutil.which("xvfb-run")
-            if xvfb_path:
-                cmd = [xvfb_path, "-a", fc_bin, projector_script]
-            else:
-                cmd = [fc_bin, projector_script]
-
-    if fc_bin:
-        # Check if running in the Streamlit Cloud sandbox.
-        # Streamlit Cloud mounts repositories under "/mount/src/".
-        # Running Xvfb/FreeCAD GUI inside Streamlit Cloud's container is restricted and times out.
-        if "mount/src" in os.path.abspath(__file__) or "mount/src" in os.getcwd():
-            logger.warning("Streamlit Cloud environment detected. Bypassing FreeCAD subprocess to avoid Xvfb sandbox timeout.")
-            fc_bin = None
-
-    if fc_bin:
-        import json
-        import subprocess
-        
-        args_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'freecad_args.json')
-        config = {
-            "input_file": os.path.abspath(file_path),
-            "output_file": os.path.abspath(output_svg_path),
-            "views": views
-        }
-        
+    if HAS_FREECAD:
         try:
-            with open(args_path, 'w') as f:
-                json.dump(config, f, indent=2)
-                
-            logger.info(f"Spawning native FreeCAD GUI subprocess to project: {' '.join(cmd)}")
-            
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            
-            # Clean up the JSON args file
-            if os.path.exists(args_path):
-                os.remove(args_path)
-                
-            # Verify success (SVG output file is generated, is not empty, and has actual shapes in DrawingContent)
-            if os.path.exists(output_svg_path) and os.path.getsize(output_svg_path) > 2000 and not is_svg_drawing_empty(output_svg_path):
-                logger.info("Successfully generated native FreeCAD projected drawing via subprocess!")
-                return {
-                    "source": "cad_freecad",
-                    "file_path": output_svg_path,
-                    "has_freecad": True,
-                    "views_projected": views
-                }
-            else:
-                logger.warning(f"FreeCAD subprocess executed but did not generate a valid or non-empty SVG. Exit code: {res.returncode}. Stderr: {res.stderr}")
-                # Clean up empty files so fallback doesn't read them
-                if os.path.exists(output_svg_path):
-                    try:
-                        os.remove(output_svg_path)
-                    except Exception:
-                        pass
-                output_pdf = os.path.splitext(output_svg_path)[0] + ".pdf"
-                if os.path.exists(output_pdf):
-                    try:
-                        os.remove(output_pdf)
-                    except Exception:
-                        pass
+            return project_3d_cad_in_process(file_path, views)
         except Exception as e:
-            logger.error(f"Failed to execute FreeCAD subprocess projector: {e}")
-            if os.path.exists(args_path):
-                os.remove(args_path)
-                
+            logger.error(f"Failed headless in-process projection: {e}. Falling back to mockup/parser.")
+            
     # Fallback to pure-python mock CAD generator
     logger.info("FreeCAD not available or failed. Generating premium mock CAD geometry...")
     return generate_mock_cad_geometry(file_path, views)
@@ -370,20 +443,14 @@ def generate_delta_asda_a3_drawing(views):
 
 def load_delta_expected_geometry(file_path, views):
     """
-    Natively parses the 3D IGES file directly, extracts all 3D line entities,
+    Natively parses the 3D IGES file directly, extracts 3D line (110) and circular arc (100) entities,
     and performs a mathematical 3D-to-2D projection to Top, Front, and Side views.
     This is fully general-purpose, scalable, and dynamically filters out detail clutter.
     """
     logger.info(f"Parsing 3D CAD model directly: {file_path}")
     filename = os.path.basename(file_path)
-    clean_name = os.path.splitext(filename)[0].upper()
     
-    # Direct high-fidelity procedural override for Delta ASDA-A3 servo drive model to match reference prints
-    if "DELTA" in clean_name or "ASDA" in clean_name or "ASD-A3" in clean_name:
-        logger.info("Delta ASDA-A3 servo drive detected. Generating premium high-fidelity engineering drawing matching reference prints.")
-        return generate_delta_asda_a3_drawing(views)
-    
-    # 1. First pass: Scan the Directory Entry (D) section to find all 110 (LINE) pointers
+    # 1. First pass: Scan the Directory Entry (D) section to find 110 and 100 pointers
     p_pointers = {}
     with open(file_path, "r", errors="ignore") as f:
         for line in f:
@@ -393,17 +460,17 @@ def load_delta_expected_geometry(file_path, views):
             if section == 'D':
                 try:
                     ent_type = int(line[0:8].strip())
-                    if ent_type == 110:  # LINE entity
+                    if ent_type in (110, 100):
                         # Parameter data line number is in columns 9-16
                         param_line = int(line[8:16].strip())
-                        # Directory entry line index is in columns 65-72 (D line index)
+                        # Directory entry line index is in columns 65-72
                         d_index = int(line[64:72].strip())
-                        p_pointers[param_line] = d_index
+                        p_pointers[param_line] = (ent_type, d_index)
                 except ValueError:
                     continue
                     
     if not p_pointers:
-        logger.warning("No native 3D line entities (110) found in Directory section.")
+        logger.warning("No native 3D line (110) or circular arc (100) entities found.")
         return None
         
     # 2. Second pass: Parse coordinate details from Parameter (P) section
@@ -420,12 +487,13 @@ def load_delta_expected_geometry(file_path, views):
             except ValueError:
                 continue
             if line_no in p_pointers:
-                # Parse coordinates: "110, X1, Y1, Z1, X2, Y2, Z2;"
+                ent_type, d_index = p_pointers[line_no]
                 content = line[0:64].strip()
                 # Clean delimiters and replace Fortran double-precision exponent 'D' with 'E'
                 clean = content.replace(";", "").replace(" ", "").replace("D", "E").replace("d", "e")
                 parts = clean.split(",")
-                if len(parts) >= 7 and parts[0] == "110":
+                
+                if ent_type == 110 and len(parts) >= 7 and parts[0] == "110":
                     try:
                         x1 = float(parts[1])
                         y1 = float(parts[2])
@@ -434,6 +502,40 @@ def load_delta_expected_geometry(file_path, views):
                         y2 = float(parts[5])
                         z2 = float(parts[6])
                         lines_3d.append(((x1, y1, z1), (x2, y2, z2)))
+                    except ValueError:
+                        continue
+                elif ent_type == 100 and len(parts) >= 8 and parts[0] == "100":
+                    try:
+                        z_t = float(parts[1])
+                        x_c = float(parts[2])
+                        y_c = float(parts[3])
+                        x1 = float(parts[4])
+                        y1 = float(parts[5])
+                        x2 = float(parts[6])
+                        y2 = float(parts[7])
+                        
+                        r = math.sqrt((x1 - x_c)**2 + (y1 - y_c)**2)
+                        if r > 0.01:
+                            theta1 = math.atan2(y1 - y_c, x1 - x_c)
+                            theta2 = math.atan2(y2 - y_c, x2 - x_c)
+                            
+                            # Discretize arc to 16 3D lines
+                            pts = []
+                            num_points = 16
+                            if math.isclose(x1, x2, abs_tol=1e-3) and math.isclose(y1, y2, abs_tol=1e-3):
+                                theta2 = theta1 + 2 * math.pi
+                            if theta2 < theta1:
+                                theta2 += 2 * math.pi
+                                
+                            for step in range(num_points + 1):
+                                t = step / num_points
+                                angle = theta1 + t * (theta2 - theta1)
+                                x = x_c + r * math.cos(angle)
+                                y = y_c + r * math.sin(angle)
+                                pts.append((x, y, z_t))
+                                
+                            for idx in range(len(pts) - 1):
+                                lines_3d.append((pts[idx], pts[idx+1]))
                     except ValueError:
                         continue
                         
@@ -465,10 +567,9 @@ def load_delta_expected_geometry(file_path, views):
     model_h = abs(p98_y - p2_y)
     model_d = abs(p98_z - p2_z)
     
-    # Bounding box diagonal for detail/clutter filtering
     diagonal = math.sqrt(model_w**2 + model_h**2 + model_d**2)
     
-    # Filter lines: ignore extreme outliers and short internal details (lines < 3% of diagonal)
+    # Filter lines: ignore extreme outliers and short internal details
     filtered_lines_3d = []
     margin_x = model_w * 0.1 if model_w > 0 else 1.0
     margin_y = model_h * 0.1 if model_h > 0 else 1.0
@@ -482,15 +583,13 @@ def load_delta_expected_geometry(file_path, views):
         x1, y1, z1 = l[0]
         x2, y2, z2 = l[1]
         
-        # Check boundary limits
         if not (lim_min_x <= x1 <= lim_max_x and lim_min_x <= x2 <= lim_max_x and
                 lim_min_y <= y1 <= lim_max_y and lim_min_y <= y2 <= lim_max_y and
                 lim_min_z <= z1 <= lim_max_z and lim_min_z <= z2 <= lim_max_z):
             continue
             
-        # Filter clutter: skip short lines representing minor internal components (circuits, vents, screws)
         length = math.sqrt((x2-x1)**2 + (y2-y1)**2 + (z2-z1)**2)
-        if length < diagonal * 0.03:
+        if length < diagonal * 0.02:  # slightly lowered to preserve arcs
             continue
             
         filtered_lines_3d.append(l)
@@ -498,7 +597,7 @@ def load_delta_expected_geometry(file_path, views):
     if not filtered_lines_3d:
         filtered_lines_3d = lines_3d
         
-    # Recompute clean model bounds for layout dimensioning
+    # Recompute clean bounds
     xs_clean = []
     ys_clean = []
     zs_clean = []
@@ -542,12 +641,11 @@ def load_delta_expected_geometry(file_path, views):
         "height": 210
     }
     
-    # Centered spaced coordinates on the A4 page to prevent any overlaps
-    tx, ty = 80, 60
-    fx, fy = 200, 60
-    sx, sy = 80, 155
+    # Centered spaced coordinates on the A4 page (top: 80,65; front: 80,145; side: 180,145)
+    tx, ty = 80, 65
+    fx, fy = 80, 145
+    sx, sy = 180, 145
     
-    # Helper to fit, center, and scale lines into view limits dynamically
     def fit_lines(lines_group, target_center, max_size=65):
         if not lines_group:
             return [], 0, 0
@@ -606,7 +704,7 @@ def load_delta_expected_geometry(file_path, views):
         }
         
     if 'side' in views and side_group:
-        fitted, w_fit, h_fit = fit_lines(side_group, (sx, sy), max_size=50)
+        fitted, w_fit, h_fit = fit_lines(side_group, (sx, sy), max_size=40)
         geometry_data["views"]["side"] = {
             "title": "SIDE VIEW (PROFILE)",
             "center": (sx, sy),
