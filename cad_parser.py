@@ -339,10 +339,62 @@ def load_delta_expected_geometry(file_path, views):
         if not lines_group:
             return []
             
-        min_x = min(min(l["start"][0], l["end"][0]) for l in lines_group)
-        max_x = max(max(l["start"][0], l["end"][0]) for l in lines_group)
-        min_y = min(min(l["start"][1], l["end"][1]) for l in lines_group)
-        max_y = max(max(l["start"][1], l["end"][1]) for l in lines_group)
+        # Extract all endpoint coordinates to analyze distribution
+        xs = []
+        ys = []
+        for l in lines_group:
+            xs.extend([l["start"][0], l["end"][0]])
+            ys.extend([l["start"][1], l["end"][1]])
+            
+        if not xs:
+            return []
+            
+        # Sort coordinates to find percentiles
+        xs_sorted = sorted(xs)
+        ys_sorted = sorted(ys)
+        n = len(xs_sorted)
+        
+        # Use 2nd and 98th percentiles to define a robust bounding box,
+        # ignoring extreme outliers (like datum planes or origin marks at 0,0,0)
+        p2_x = xs_sorted[int(n * 0.02)]
+        p98_x = xs_sorted[int(n * 0.98)]
+        p2_y = ys_sorted[int(n * 0.02)]
+        p98_y = ys_sorted[int(n * 0.98)]
+        
+        # Add a 10% padding to the robust bounding box
+        rx_w = p98_x - p2_x
+        ry_h = p98_y - p2_y
+        
+        margin_x = rx_w * 0.1 if rx_w > 0 else 1.0
+        margin_y = ry_h * 0.1 if ry_h > 0 else 1.0
+        
+        limit_min_x = p2_x - margin_x
+        limit_max_x = p98_x + margin_x
+        limit_min_y = p2_y - margin_y
+        limit_max_y = p98_y + margin_y
+        
+        # Filter lines that fall within this robust bounding box
+        valid_lines = []
+        for l in lines_group:
+            x1, y1 = l["start"]
+            x2, y2 = l["end"]
+            if (limit_min_x <= x1 <= limit_max_x and limit_min_x <= x2 <= limit_max_x and
+                limit_min_y <= y1 <= limit_max_y and limit_min_y <= y2 <= limit_max_y):
+                valid_lines.append(l)
+                
+        # If filtering left us with nothing, fall back to the original list
+        if not valid_lines:
+            valid_lines = lines_group
+            
+        # Recompute bounding box of valid lines for scaling
+        v_xs = []
+        v_ys = []
+        for l in valid_lines:
+            v_xs.extend([l["start"][0], l["end"][0]])
+            v_ys.extend([l["start"][1], l["end"][1]])
+            
+        min_x, max_x = min(v_xs), max(v_xs)
+        min_y, max_y = min(v_ys), max(v_ys)
         
         w_box = max_x - min_x
         h_box = max_y - min_y
@@ -354,7 +406,7 @@ def load_delta_expected_geometry(file_path, views):
         scale = max_size / curr_max if curr_max > 0 else 1.0
         
         fitted = []
-        for l in lines_group:
+        for l in valid_lines:
             x1 = target_center[0] + (l["start"][0] - cx) * scale
             y1 = target_center[1] + (l["start"][1] - cy) * scale
             x2 = target_center[0] + (l["end"][0] - cx) * scale
@@ -371,7 +423,7 @@ def load_delta_expected_geometry(file_path, views):
     if 'top' in views and top_group:
         tx, ty = 80, 70
         geometry_data["views"]["top"] = {
-            "title": f"TOP VIEW - {clean_name} (SECTIONAL)",
+            "title": "TOP VIEW (SECTIONAL)",
             "center": (tx, ty),
             "lines": fit_lines(top_group, (tx, ty), max_size=50),
             "circles": [],
@@ -385,7 +437,7 @@ def load_delta_expected_geometry(file_path, views):
     if 'front' in views and front_group:
         fx, fy = 200, 70
         geometry_data["views"]["front"] = {
-            "title": f"FRONT VIEW - {clean_name} (ORTHOGRAPHIC)",
+            "title": "FRONT VIEW (ORTHOGRAPHIC)",
             "center": (fx, fy),
             "lines": fit_lines(front_group, (fx, fy), max_size=60),
             "circles": [],
@@ -399,7 +451,7 @@ def load_delta_expected_geometry(file_path, views):
     if 'side' in views and side_group:
         sx, sy = 80, 150
         geometry_data["views"]["side"] = {
-            "title": f"SIDE VIEW - {clean_name} (PROFILE)",
+            "title": "SIDE VIEW (PROFILE)",
             "center": (sx, sy),
             "lines": fit_lines(side_group, (sx, sy), max_size=50),
             "circles": [],
