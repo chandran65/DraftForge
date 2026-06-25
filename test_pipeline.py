@@ -134,10 +134,24 @@ def run_tests():
             success = False
             
         # Cleaning up generated source files
-        if os.path.exists(test_img_input):
-            os.remove(test_img_input)
-        if os.path.exists(test_igs_input):
-            os.remove(test_igs_input)
+        for f in [
+            test_img_input,
+            test_igs_input,
+            f"{output_pdf_base}.svg",
+            f"{output_pdf_base}.pdf",
+            f"{output_pdf_base}.png",
+            f"{output_cad_base}.svg",
+            f"{output_cad_base}.pdf",
+            f"{output_cad_base}.png",
+            "test_auto_output.svg",
+            "test_auto_output.pdf",
+            "test_auto_output.png",
+        ]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception as e:
+                    logger.warning(f"Could not remove temporary test file {f}: {e}")
             
         logger.info("\n" + "=" * 60)
         if success:

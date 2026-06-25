@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS-specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# DraftForge Output directory (ignore all generated outputs)
+Output/*
+!Output/.gitkeep
+
+# Integration test outputs generated in root
+test_auto_output.*
+test_cad_output.*
+test_drawing_output.*
+test_synthetic_drawing.png
+test_synthetic_cad.igs
+
+# Logs
+*.log
+freecad_projector_run.log
