@@ -331,7 +331,7 @@ else:
         </ul>
         <hr style='border: 0; border-top: 1px solid rgba(0, 0, 0, 0.08); margin: 20px 0;'>
         <p style='color: #64748B; font-size: 13px; font-family: "JetBrains Mono", monospace; margin-bottom: 0;'>
-            💡 To test the pipeline out-of-the-box, you can find the sample Delta Servo Drive Frame IGES model inside the <code>Input/</code> directory.
+            💡 To test the pipeline out-of-the-box, you can find the sample IGES model `Input/ex3.iges` inside the <code>Input/</code> directory.
         </p>
     </div>
     """, unsafe_allow_html=True)
