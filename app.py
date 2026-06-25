@@ -1,6 +1,7 @@
 import os
 import shutil
 import tempfile
+import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -317,12 +318,18 @@ if uploaded_file is not None:
                             scrolling=True,
                         )
 
+                    # ── Store in session_state for hole editor ────────────────
+                    st.session_state["_gd"]       = geometry_data
+                    st.session_state["_svg_out"]  = svg_out
+                    st.session_state["_pdf_out"]  = pdf_out
+                    st.session_state["_out_base"] = output_base
+                    st.session_state["_theme"]    = selected_theme
+                    st.session_state["_fname"]    = file_name
+
                     st.markdown("#### Download Blueprint Formats")
                     st.caption("Select your target high-precision export formats below:")
 
                     col1, col2 = st.columns(2)
-
-                    # 1. Download SVG button
                     if os.path.exists(svg_out):
                         with open(svg_out, "rb") as file:
                             col1.download_button(
@@ -332,8 +339,6 @@ if uploaded_file is not None:
                                 mime="image/svg+xml",
                                 use_container_width=True,
                             )
-
-                    # 2. Download PDF button
                     if os.path.exists(pdf_out):
                         with open(pdf_out, "rb") as file:
                             col2.download_button(
@@ -343,10 +348,125 @@ if uploaded_file is not None:
                                 mime="application/pdf",
                                 use_container_width=True,
                             )
-                        
+
                 except Exception as e:
                     st.exception(e)
                     st.error(f"Pipeline encountered a compilation error: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Hole Dimensions & Editor  (persists across reruns via session_state)
+# ═══════════════════════════════════════════════════════════════════════════
+if "_gd" in st.session_state:
+    gd          = st.session_state["_gd"]
+    _out_base   = st.session_state["_out_base"]
+    _theme      = st.session_state["_theme"]
+    _fname      = st.session_state["_fname"]
+
+    # Collect all holes from all views
+    all_holes = []
+    for vname, vdata in gd.get("views", {}).items():
+        for h in vdata.get("holes", []):
+            all_holes.append({
+                "ID":          h.get("id", "?"),
+                "View":        vname,
+                "Diameter (mm)": float(h.get("diameter", 0)),
+                "Depth (mm)":   float(h.get("depth", 0)),
+                "X mm":        round(h["center_3d"][0], 3) if h.get("center_3d") else 0,
+                "Y mm":        round(h["center_3d"][1], 3) if h.get("center_3d") else 0,
+                "Z mm":        round(h["center_3d"][2], 3) if h.get("center_3d") else 0,
+                "_view":       vname,   # hidden key for mapping back
+                "_idx":        h.get("id", "?"),
+            })
+
+    with st.expander(f"🔩 Detected Holes & Dimensions  ({len(all_holes)} found)", expanded=bool(all_holes)):
+        if not all_holes:
+            st.info("No circular holes detected in this view/model. Try the **Initial (Top)** view which shows holes as circles.")
+        else:
+            st.markdown(
+                "**Edit** Diameter or Depth values below, then click **Apply Changes** "
+                "to update the annotations on the drawing."
+            )
+            st.caption("ℹ️ Editing values here changes the *callout labels* on the drawing — the underlying CAD geometry is unchanged.")
+
+            df = pd.DataFrame(all_holes)
+            display_cols = ["ID", "View", "Diameter (mm)", "Depth (mm)", "X mm", "Y mm", "Z mm"]
+            edited_df = st.data_editor(
+                df[display_cols],
+                num_rows="fixed",
+                use_container_width=True,
+                column_config={
+                    "ID":             st.column_config.TextColumn("ID", disabled=True, width="small"),
+                    "View":           st.column_config.TextColumn("View", disabled=True, width="small"),
+                    "Diameter (mm)":  st.column_config.NumberColumn("⌀ Diameter (mm)", min_value=0.0, step=0.01, format="%.3f"),
+                    "Depth (mm)":     st.column_config.NumberColumn("↧ Depth (mm)", min_value=0.0, step=0.01, format="%.3f"),
+                    "X mm":           st.column_config.NumberColumn("X (mm)", disabled=True, format="%.3f"),
+                    "Y mm":           st.column_config.NumberColumn("Y (mm)", disabled=True, format="%.3f"),
+                    "Z mm":           st.column_config.NumberColumn("Z (mm)", disabled=True, format="%.3f"),
+                },
+                key="hole_editor",
+            )
+
+            col_apply, col_info = st.columns([1, 3])
+            apply_clicked = col_apply.button("🔄 Apply Changes & Re-render", type="primary", use_container_width=True)
+            col_info.caption("Updates ⌀ callout labels on drawing with your edited values, then re-generates SVG/PDF.")
+
+            if apply_clicked:
+                # Map edited values back into geometry_data holes
+                id_to_row = {row["ID"]: row for row in edited_df.to_dict(orient="records")}
+                for vname, vdata in gd.get("views", {}).items():
+                    for h in vdata.get("holes", []):
+                        hid = h.get("id", "?")
+                        if hid in id_to_row:
+                            row = id_to_row[hid]
+                            new_d = row["Diameter (mm)"]
+                            new_dep = row["Depth (mm)"]
+                            h["diameter"]  = new_d
+                            h["depth"]     = new_dep
+                            dep_str = f" ↧{new_dep:.2f}" if new_dep > 0.05 else ""
+                            h["label"] = f"⌀{new_d:.2f}{dep_str}"
+
+                # Re-render with updated labels
+                with st.spinner("Re-rendering drawing with updated hole annotations..."):
+                    from renderer import render_pipeline_output
+                    new_svg, new_pdf = render_pipeline_output(gd, _out_base + "_edited", theme_name=_theme)
+
+                st.success("Drawing updated!")
+
+                # Show updated SVG inline
+                if os.path.exists(new_svg):
+                    with open(new_svg, "r", encoding="utf-8") as f_s:
+                        new_svg_content = f_s.read()
+                    components.html(
+                        f"""
+                        <div style="background:#f8fafc;border:2px solid #0284C7;border-radius:10px;
+                                    padding:16px;overflow:auto;margin-bottom:12px;">
+                            <div style="display:flex;justify-content:center;">
+                                {new_svg_content}
+                            </div>
+                        </div>
+                        """,
+                        height=600, scrolling=True,
+                    )
+                    col_dl1, col_dl2 = st.columns(2)
+                    with open(new_svg, "rb") as f_dl:
+                        col_dl1.download_button(
+                            "⬇️ Download Updated SVG",
+                            data=f_dl,
+                            file_name=f"{os.path.splitext(_fname)[0]}_edited.svg",
+                            mime="image/svg+xml",
+                            use_container_width=True,
+                        )
+                    if os.path.exists(new_pdf):
+                        with open(new_pdf, "rb") as f_dl2:
+                            col_dl2.download_button(
+                                "⬇️ Download Updated PDF",
+                                data=f_dl2,
+                                file_name=f"{os.path.splitext(_fname)[0]}_edited.pdf",
+                                mime="application/pdf",
+                                use_container_width=True,
+                            )
+
+
 
 else:
     # Welcome page when no file is uploaded yet

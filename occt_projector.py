@@ -215,8 +215,199 @@ def _tessellate_faces(shape, view: str, precision: float = TESS_PREC):
 
 
 # ---------------------------------------------------------------------------
-# Normalization
+# Hole Detection (circular edges facing the camera)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Hole Detection (circular edges facing the camera)
+# ---------------------------------------------------------------------------
+def fit_circle_2d(pts):
+    n = len(pts)
+    if n < 5:
+        return None
+    mean_u = sum(p[0] for p in pts) / n
+    mean_v = sum(p[1] for p in pts) / n
+    uu = [p[0] - mean_u for p in pts]
+    vv = [p[1] - mean_v for p in pts]
+    
+    su = sum(uu); sv = sum(vv)
+    su2 = sum(x*x for x in uu); sv2 = sum(y*y for y in vv); suv = sum(x*y for x, y in zip(uu, vv))
+    su3 = sum(x*x*x for x in uu); sv3 = sum(y*y*y for y in vv)
+    su2v = sum(x*x*y for x, y in zip(uu, vv)); suv2 = sum(x*y*y for x, y in zip(uu, vv))
+    
+    det = 4 * (su2 * sv2 - suv * suv)
+    if abs(det) < 1e-9:
+        return None
+    A, B, D = 2 * su2, 2 * suv, su3 + suv2
+    E, F, G = 2 * suv, 2 * sv2, su2v + sv3
+    uc = (D * F - B * G) / det
+    vc = (A * G - D * E) / det
+    C = (su2 + sv2) / n
+    R2 = C + uc**2 + vc**2
+    if R2 < 0: return None
+    R = math.sqrt(R2)
+    center_u, center_v = uc + mean_u, vc + mean_v
+    
+    residuals = [math.sqrt((u - uc)**2 + (v - vc)**2) - R for u, v in zip(uu, vv)]
+    mean_err = sum(residuals) / n
+    variance = sum((r - mean_err)**2 for r in residuals) / n
+    std_dev = math.sqrt(variance)
+    return center_u, center_v, R, std_dev
+
+def fit_circle_3d(pts_3d):
+    n = len(pts_3d)
+    if n < 5: return None
+    mx = sum(p.x for p in pts_3d) / n
+    my = sum(p.y for p in pts_3d) / n
+    mz = sum(p.z for p in pts_3d) / n
+    
+    nx, ny, nz = 0.0, 0.0, 0.0
+    for i in range(1, n - 1):
+        v1x, v1y, v1z = pts_3d[i].x - mx, pts_3d[i].y - my, pts_3d[i].z - mz
+        v2x, v2y, v2z = pts_3d[i+1].x - mx, pts_3d[i+1].y - my, pts_3d[i+1].z - mz
+        cx, cy, cz = v1y * v2z - v1z * v2y, v1z * v2x - v1x * v2z, v1x * v2y - v1y * v2x
+        nx += cx; ny += cy; nz += cz
+    nmag = math.sqrt(nx*nx + ny*ny + nz*nz)
+    if nmag < 1e-6: return None
+    nx /= nmag; ny /= nmag; nz /= nmag
+    
+    ax, ay, az = (1.0, 0.0, 0.0) if abs(nx) < 0.9 else (0.0, 1.0, 0.0)
+    dot = ax * nx + ay * ny + az * nz
+    ux, uy, uz = ax - dot * nx, ay - dot * ny, az - dot * nz
+    umag = math.sqrt(ux*ux + uy*uy + uz*uz)
+    ux /= umag; uy /= umag; uz /= umag
+    vx, vy, vz = ny * uz - nz * uy, nz * ux - nx * uz, nx * uy - ny * ux
+    
+    pts_2d = [( (p.x - mx)*ux + (p.y - my)*uy + (p.z - mz)*uz, (p.x - mx)*vx + (p.y - my)*vy + (p.z - mz)*vz ) for p in pts_3d]
+    fit = fit_circle_2d(pts_2d)
+    if fit is None: return None
+    uc, vc, R, err = fit
+    cx, cy, cz = mx + uc * ux + vc * vx, my + uc * uy + vc * vy, mz + uc * uz + vc * vz
+    return cx, cy, cz, nx, ny, nz, R, err
+
+def _detect_holes(edges, view_name, np_params):
+    """
+    Robust scan of edges using 3D circle fitting and arc grouping.
+    Supports native circular edges, NURBS BSpline representations, 
+    and split/segmented circular arcs.
+    """
+    cam = VIEW_CAM_DIR.get(view_name, (0, -1, 0))
+    arcs = []
+    
+    for edge in edges:
+        try:
+            pts_3d = edge.discretize(24)
+            fit = fit_circle_3d(pts_3d)
+            if fit is None:
+                continue
+            cx, cy, cz, nx, ny, nz, R, err = fit
+            if R < 0.05 or err / R > 0.008:
+                continue
+            
+            # Check: circle must face the camera (axis ∥ cam direction)
+            dot = abs(nx*cam[0] + ny*cam[1] + nz*cam[2])
+            if dot < 0.85:
+                continue             # circle is too tilted
+                
+            p0, p1 = pts_3d[0], pts_3d[-1]
+            dist_ends = math.sqrt((p1.x - p0.x)**2 + (p1.y - p0.y)**2 + (p1.z - p0.z)**2)
+            if dist_ends < 0.05:
+                span_deg = 360.0
+            else:
+                chord = math.sqrt((p1.x - p0.x)**2 + (p1.y - p0.y)**2 + (p1.z - p0.z)**2)
+                ratio = min(1.0, chord / (2 * R))
+                span_deg = math.degrees(2 * math.asin(ratio))
+                
+            arcs.append({
+                "center": (cx, cy, cz),
+                "radius": R,
+                "span": span_deg,
+            })
+        except Exception:
+            pass
+
+    if not arcs:
+        return []
+
+    # ---- Group arcs representing same circle at same depth ----------------
+    from collections import defaultdict
+    arc_groups = defaultdict(list)
+    for arc in arcs:
+        cx, cy, cz = arc["center"]
+        key = (
+            round(arc["radius"], 2),
+            round(cx, 1),
+            round(cy, 1),
+            round(cz, 1),
+        )
+        arc_groups[key].append(arc)
+
+    circles_3d = []
+    for key, group in arc_groups.items():
+        total_span = sum(a["span"] for a in group)
+        if total_span >= 270.0:
+            avg_cx = sum(a["center"][0] for a in group) / len(group)
+            avg_cy = sum(a["center"][1] for a in group) / len(group)
+            avg_cz = sum(a["center"][2] for a in group) / len(group)
+            avg_r = sum(a["radius"] for a in group) / len(group)
+            
+            import FreeCAD
+            center_vec = FreeCAD.Vector(avg_cx, avg_cy, avg_cz)
+            center_2d = _project_pt(center_vec, view_name)
+            depth_coord = _depth_pt(center_vec, view_name)
+            
+            circles_3d.append({
+                "center_3d": [avg_cx, avg_cy, avg_cz],
+                "radius": avg_r,
+                "center_2d": list(center_2d),
+                "depth_coord": depth_coord,
+            })
+
+    if not circles_3d:
+        return []
+
+    # ---- Group 3D circles by 2D projection (same hole) --------------------
+    hole_groups = defaultdict(list)
+    for c in circles_3d:
+        cx_2d, cy_2d = c["center_2d"]
+        key = (
+            round(c["radius"], 2),
+            round(cx_2d, 0),
+            round(cy_2d, 0),
+        )
+        hole_groups[key].append(c)
+
+    holes = []
+    for key, group in hole_groups.items():
+        group_s = sorted(group, key=lambda c: c["depth_coord"], reverse=True)
+        rep = group_s[0]
+        
+        if len(group_s) > 1:
+            depth = abs(group_s[0]["depth_coord"] - group_s[-1]["depth_coord"])
+        else:
+            depth = 0.0
+
+        norm_cx, norm_cy = _norm_pt(
+            rep["center_2d"][0], rep["center_2d"][1], *np_params
+        )
+        radius_norm = rep["radius"] * np_params[2]
+
+        holes.append({
+            "diameter":    round(rep["radius"] * 2,  3),
+            "radius_norm": round(radius_norm, 3),
+            "depth":       round(depth,       3),
+            "center":      [round(norm_cx, 3), round(norm_cy, 3)],
+            "center_3d":   rep["center_3d"],
+            "label":       f"⌀{rep['radius']*2:.2f}",
+        })
+
+    holes.sort(key=lambda h: h["diameter"])
+    for i, h in enumerate(holes):
+        h["id"] = f"H{i+1}"
+
+    print(f"[occt] Detected {len(holes)} holes using robust 3D fitting", flush=True)
+    return holes
+
+
 def _compute_bbox(svg_paths):
     xs, ys = [], []
     for d in svg_paths:
@@ -330,6 +521,16 @@ def project_iges_step(
     # ---- Normalization parameters (derived from all edges) -----------------
     np_params = _get_norm_params(all_paths, center, max_dim)
 
+    # ---- Detect holes (circular edges facing this view) --------------------
+    holes = _detect_holes(edges, view_name, np_params)
+
+    bolt_holes = []
+    for h in holes:
+        bolt_holes.append({
+            "center": h["center"],
+            "radius": h["radius_norm"],
+        })
+
     # ---- Classify edges for 3D wireframe / hidden lines --------------------
     visible_paths = []
     hidden_paths  = []
@@ -399,7 +600,8 @@ def project_iges_step(
                 "faces":            faces,
                 "lines":            [],
                 "circles":          [],
-                "bolt_holes":       [],
+                "bolt_holes":       bolt_holes,
+                "holes":            holes,
                 "dimensions":       dimensions,
             }
         },

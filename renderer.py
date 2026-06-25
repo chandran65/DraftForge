@@ -267,6 +267,48 @@ def render_pipeline_output(geometry_data, output_base_path, theme_name="dark"):
                 view_group.add(dwg.line(start=(hc[0]-hr-2, hc[1]), end=(hc[0]+hr+2, hc[1]), stroke=theme["center"], stroke_width=0.15))
                 view_group.add(dwg.line(start=(hc[0], hc[1]-hr-2), end=(hc[0], hc[1]+hr+2), stroke=theme["center"], stroke_width=0.15))
 
+            # ── 4b. Hole dimension annotations ──────────────────────────────
+            for i, hole in enumerate(view.get("holes", [])):
+                hc = hole["center"]
+                hr = hole.get("radius_norm", hole.get("radius", 5)) # radius on drawing
+                label = hole.get("label", f"⌀{hole.get('diameter', 0):.2f}")
+                
+                # Draw a nice leader line pointing at 45 degrees
+                angle_deg = 45 if i % 2 == 0 else 135
+                angle_rad = math.radians(angle_deg)
+                
+                # Start on circle boundary
+                x_start = hc[0] + hr * math.cos(angle_rad)
+                y_start = hc[1] - hr * math.sin(angle_rad) # SVG coordinates (+Y is down, so subtract to go up)
+                
+                # End point for leader line
+                leader_len = 10
+                x_end = hc[0] + (hr + leader_len) * math.cos(angle_rad)
+                y_end = hc[1] - (hr + leader_len) * math.sin(angle_rad)
+                
+                # Horizontal shoulder line
+                shoulder_len = 8 if i % 2 == 0 else -8
+                x_shoulder = x_end + shoulder_len
+                y_shoulder = y_end
+                
+                # Draw the leader lines
+                view_group.add(dwg.line(start=(x_start, y_start), end=(x_end, y_end), stroke=theme["dimension"], stroke_width=0.25))
+                view_group.add(dwg.line(start=(x_end, y_end), end=(x_shoulder, y_shoulder), stroke=theme["dimension"], stroke_width=0.25))
+                
+                # Draw the text label
+                text_anchor = "start" if shoulder_len > 0 else "end"
+                text_x = x_shoulder + (1 if shoulder_len > 0 else -1)
+                text_y = y_shoulder - 1 # slightly above the shoulder line
+                
+                view_group.add(dwg.text(
+                    label,
+                    insert=(text_x, text_y),
+                    font_size=3.0,
+                    fill=theme["text"],
+                    text_anchor=text_anchor,
+                    font_family="Inter, Roboto, sans-serif"
+                ))
+
             # ── 5. Dimension annotations ──────────────────────────────────────
             for dim in view.get("dimensions", []):
                 draw_dimension_callout(dwg, view_group, dim, theme)
@@ -521,6 +563,49 @@ def compile_pdf(geometry_data, svg_path, pdf_path, theme):
                         c.setLineWidth(0.3)
                         c.line(hc_x - hr - 2*pt, hc_y, hc_x + hr + 2*pt, hc_y)
                         c.line(hc_x, hc_y - hr - 2*pt, hc_x, hc_y + hr + 2*pt)
+
+                    # Draw hole dimensions/labels (ReportLab)
+                    for i, hole in enumerate(view.get("holes", [])):
+                        hc = hole["center"]
+                        hr = hole.get("radius_norm", hole.get("radius", 5))
+                        label = hole.get("label", f"⌀{hole.get('diameter', 0):.2f}")
+                        
+                        angle_deg = 45 if i % 2 == 0 else 135
+                        angle_rad = math.radians(angle_deg)
+                        
+                        x_start_raw = hc[0] + hr * math.cos(angle_rad)
+                        y_start_raw = hc[1] - math.sin(angle_rad) * hr
+                        
+                        leader_len = 10
+                        x_end_raw = hc[0] + (hr + leader_len) * math.cos(angle_rad)
+                        y_end_raw = hc[1] - (hr + leader_len) * math.sin(angle_rad)
+                        
+                        shoulder_len = 8 if i % 2 == 0 else -8
+                        x_shoulder_raw = x_end_raw + shoulder_len
+                        y_shoulder_raw = y_end_raw
+                        
+                        x_start = x_start_raw * pt
+                        y_start = h_pt - y_start_raw * pt
+                        x_end = x_end_raw * pt
+                        y_end = h_pt - y_end_raw * pt
+                        x_shoulder = x_shoulder_raw * pt
+                        y_shoulder = h_pt - y_shoulder_raw * pt
+                        
+                        c.setStrokeColor(theme["dimension"])
+                        c.setLineWidth(0.6)
+                        c.setDash([])
+                        c.line(x_start, y_start, x_end, y_end)
+                        c.line(x_end, y_end, x_shoulder, y_shoulder)
+                        
+                        c.setFillColor(theme["text"])
+                        c.setFont("Helvetica", 3.0 * pt)
+                        text_x = x_shoulder + (1 * pt if shoulder_len > 0 else -1 * pt)
+                        text_y = y_shoulder + 1 * pt # shift slightly up in ReportLab coordinate space
+                        
+                        if shoulder_len > 0:
+                            c.drawString(text_x, text_y, label)
+                        else:
+                            c.drawRightString(text_x, text_y, label)
                         
                     # Draw dimensions (ReportLab)
                     for dim in view.get("dimensions", []):
