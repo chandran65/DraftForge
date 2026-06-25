@@ -204,6 +204,85 @@ def main():
             'iso': FreeCAD.Vector(1, -1, 1)
         }
         
+        # Setup TechDraw Page and Template
+        page = doc.addObject("TechDraw::DrawPage", "Page")
+        template = doc.addObject("TechDraw::DrawSVGTemplate", "Template")
+        template_paths = [
+            os.path.join(FreeCAD.getHomePath(), "share", "Mod", "TechDraw", "Templates", "ISO", "A4_Landscape_TD.svg"),
+            os.path.join(FreeCAD.getHomePath(), "Mod", "TechDraw", "Templates", "A4_Landscape_TD.svg"),
+            "/Applications/FreeCAD.app/Contents/Resources/share/Mod/TechDraw/Templates/ISO/A4_Landscape_TD.svg"
+        ]
+        template_path = None
+        for p in template_paths:
+            if os.path.exists(p):
+                template_path = p
+                break
+        if template_path:
+            template.Template = template_path
+            page.Template = template
+            
+        import xml.etree.ElementTree as ET
+        import re
+
+        def parse_techdraw_view_svg(svg_data):
+            lines_group = []
+            wrapped_xml = f"<svg xmlns=\"http://www.w3.org/2000/svg\">{svg_data}</svg>"
+            try:
+                root = ET.fromstring(wrapped_xml)
+            except Exception as e:
+                print("XML parsing failed:", e)
+                return lines_group
+                
+            for g in root.findall('.//g'):
+                stroke_width_str = g.attrib.get('stroke-width', '0.7')
+                try:
+                    stroke_width = float(stroke_width_str)
+                except ValueError:
+                    stroke_width = 0.7
+                    
+                # standard engineering styles
+                if stroke_width >= 0.5:
+                    style = "visible"
+                else:
+                    style = "hidden"
+                    
+                for path in g.findall('.//path'):
+                    d = path.attrib.get('d', '')
+                    tokens = re.findall(r'[a-zA-Z]|-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?', d)
+                    
+                    current_pt = None
+                    i = 0
+                    while i < len(tokens):
+                        token = tokens[i]
+                        if token in ('M', 'm'):
+                            try:
+                                x = float(tokens[i+1])
+                                y = float(tokens[i+2])
+                                current_pt = (x, y)
+                            except (IndexError, ValueError):
+                                pass
+                            i += 3
+                        elif token in ('L', 'l'):
+                            try:
+                                x = float(tokens[i+1])
+                                y = float(tokens[i+2])
+                                next_pt = (x, y)
+                                if current_pt:
+                                    lines_group.append({
+                                        "start": current_pt,
+                                        "end": next_pt,
+                                        "style": style
+                                    })
+                                current_pt = next_pt
+                            except (IndexError, ValueError):
+                                pass
+                            i += 3
+                        else:
+                            i += 1
+            return lines_group
+
+        imported_features = [obj for obj in doc.Objects if hasattr(obj, 'Shape') and obj.Shape is not None]
+
         for view_name in views:
             if view_name not in direction_map:
                 continue
@@ -211,61 +290,42 @@ def main():
             center = view_centers[view_name]
             dir_vec = direction_map[view_name]
             
-            res = TechDraw.project(compound_shape, dir_vec)
-            visible_g0 = res[0]
-            visible_g1 = res[1]
-            hidden_g0 = res[2]
-            hidden_g1 = res[3]
+            # Create proper DrawViewPart
+            view = doc.addObject("TechDraw::DrawViewPart", f"View_{view_name}")
+            view.Source = imported_features
+            view.Direction = dir_vec
+            view.HardHidden = True
+            view.SmoothVisible = True
+            page.addView(view)
             
-            lines_group = []
-            circles_group = []
-            bolt_holes_group = []
+            doc.recompute()
             
-            def add_edge_geom(edge, style):
-                if edge.Length < 0.05:
-                    return
-                if type(edge.Curve) == Part.Circle:
-                    center_pt = edge.Curve.Center
-                    radius = edge.Curve.Radius
-                    circ_data = {
-                        "center": (center_pt.x, center_pt.y),
-                        "radius": radius,
-                        "style": style
-                    }
-                    if radius <= 10.0:
-                        bolt_holes_group.append(circ_data)
-                    else:
-                        circles_group.append(circ_data)
-                else:
-                    pts = edge.discretize(Number=16)
-                    if len(pts) >= 2:
-                        if type(edge.Curve) == Part.Line:
-                            lines_group.append({
-                                "start": (pts[0].x, pts[0].y),
-                                "end": (pts[-1].x, pts[-1].y),
-                                "style": style
-                            })
-                        else:
-                            for idx in range(len(pts) - 1):
-                                lines_group.append({
-                                    "start": (pts[idx].x, pts[idx].y),
-                                    "end": (pts[idx+1].x, pts[idx+1].y),
-                                    "style": style
-                                })
-            
-            for e in visible_g0.Edges:
-                add_edge_geom(e, "visible")
-            for e in visible_g1.Edges:
-                add_edge_geom(e, "visible")
-            for e in hidden_g0.Edges:
-                add_edge_geom(e, "hidden")
-            for e in hidden_g1.Edges:
-                add_edge_geom(e, "hidden")
+            svg_data = ""
+            try:
+                svg_data = TechDraw.viewPartAsSvg(view)
+            except Exception as e:
+                print(f"Error getting SVG for view {view_name}: {e}")
                 
+            # If empty or HLR returned no lines (common with open shells/surfaces), toggle CoarseView
+            if not svg_data or len(svg_data.strip()) <= 150:
+                print(f"View {view_name} empty under HLR. Retrying with CoarseView=True...")
+                view.CoarseView = True
+                doc.recompute()
+                try:
+                    svg_data = TechDraw.viewPartAsSvg(view)
+                except Exception as e:
+                    print(f"Error getting CoarseView SVG for view {view_name}: {e}")
+                    
+            if not svg_data:
+                raise ValueError(f"Failed to project and export view {view_name} to SVG.")
+                
+            # Parse SVG geometry
+            lines_group = parse_techdraw_view_svg(svg_data)
+            
             max_size = 40 if view_name == 'side' else (50 if view_name in ('top', 'iso') else 60)
             
-            fitted_lines, fitted_circles, fitted_bolt_holes, w_fit, h_fit = fit_and_scale_geometries(
-                lines_group, circles_group, bolt_holes_group, center, max_size
+            fitted_lines, _, _, w_fit, h_fit = fit_and_scale_geometries(
+                lines_group, [], [], center, max_size
             )
             
             title_map = {
@@ -299,8 +359,8 @@ def main():
                 "title": title_map[view_name],
                 "center": center,
                 "lines": fitted_lines,
-                "circles": fitted_circles,
-                "bolt_holes": fitted_bolt_holes,
+                "circles": [],
+                "bolt_holes": [],
                 "dimensions": dimensions
             }
             

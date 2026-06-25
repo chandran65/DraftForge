@@ -83,9 +83,9 @@ def run_tests():
         # Create synthetic input image for Path B
         create_synthetic_blueprint_image(test_img_input)
         
-        # Create a dummy mock 3D file for Path A (the parser doesn't inspect the content in mock mode)
-        with open(test_igs_input, "w") as f:
-            f.write("DUMMY CAD IGES METADATA FILE FOR TESTING")
+        # Copy a valid sample CAD file for Path A projection test
+        import shutil
+        shutil.copy("Input/ex3.iges", test_igs_input)
             
         success = True
         
