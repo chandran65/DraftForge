@@ -1,277 +1,171 @@
 import os
 import sys
 import logging
-import math
+import subprocess
+import json
 
 logger = logging.getLogger("3d2d_pipeline.cad_parser")
 
-# Global flag to track FreeCAD availability
+# ---------------------------------------------------------------------------
+# Discover FreeCAD — needed only to confirm it's installed
+# ---------------------------------------------------------------------------
 HAS_FREECAD = False
-freecad_lib_path = None
+_freecad_python = None   # the FreeCAD-bundled Python executable
 
-def discover_freecad():
+def _find_freecad_python():
     """
-    Search for standard FreeCAD library paths based on OS and sys.path,
-    and attempt to import FreeCAD modules.
+    Return the path to the Python interpreter bundled with FreeCAD,
+    or fall back to the system Python that has FREECAD_LIB_PATH set.
     """
-    global HAS_FREECAD, freecad_lib_path
-    
-    # If the user explicitly provided a path via env var, check that first
-    env_path = os.environ.get("FREECAD_LIB_PATH")
-    paths_to_check = []
-    if env_path:
-        paths_to_check.append(env_path)
-        
-    # Standard installation paths based on platform
-    if sys.platform == "darwin":  # macOS
-        paths_to_check.extend([
-            "/Applications/FreeCAD.app/Contents/Resources/lib",
-            "/Applications/FreeCAD.app/Contents/lib",
-            "/opt/homebrew/lib",
-            "/opt/homebrew/opt/freecad/lib"
-        ])
-    elif sys.platform.startswith("linux"):  # Linux
-        paths_to_check.extend([
-            "/usr/lib/freecad/lib",
-            "/usr/lib/freecad-python3/lib",
-            "/usr/lib/freecad-daily/lib",
-            "/usr/share/freecad/lib"
-        ])
-    elif sys.platform == "win32":  # Windows
-        paths_to_check.extend([
-            r"C:\Program Files\FreeCAD\bin",
-            r"C:\Program Files\FreeCAD\lib",
-            r"C:\Program Files (x86)\FreeCAD\bin"
-        ])
+    # macOS: FreeCAD.app ships its own Python
+    candidates = [
+        "/Applications/FreeCAD.app/Contents/Resources/bin/python",
+        "/Applications/FreeCAD.app/Contents/MacOS/python",
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    # Linux: usually the system python can import FreeCAD after lib is on path
+    return sys.executable
 
-    logger.info("Scanning for FreeCAD library path...")
-    for path in paths_to_check:
-        if os.path.exists(path):
-            logger.info(f"Found potential FreeCAD directory: {path}")
-            # Add to python path if not already there
-            if path not in sys.path:
-                sys.path.append(path)
-            
-            # Add bin if on Windows
-            if sys.platform == "win32":
-                bin_path = path.replace("\\lib", "\\bin")
-                if os.path.exists(bin_path) and bin_path not in sys.path:
-                    sys.path.append(bin_path)
-                    
-            try:
-                # Attempt importing core modules
-                import FreeCAD
-                import Import
-                import TechDraw
-                HAS_FREECAD = True
-                freecad_lib_path = path
-                logger.info("Successfully imported FreeCAD, Import, and TechDraw!")
-                return True
-            except ImportError as e:
-                logger.debug(f"Failed to import FreeCAD from {path}: {e}")
-                continue
 
-    logger.warning("FreeCAD was not found on the system path or import failed.")
+def _discover_freecad():
+    global HAS_FREECAD, _freecad_python
+    py = _find_freecad_python()
+
+    # Quick test: can that python import FreeCAD?
+    lib_path = "/Applications/FreeCAD.app/Contents/Resources/lib"
+    env = os.environ.copy()
+    if os.path.isdir(lib_path):
+        env["PYTHONPATH"] = lib_path + os.pathsep + env.get("PYTHONPATH", "")
+
+    try:
+        res = subprocess.run(
+            [py, "-c", "import FreeCAD, Part; print('ok')"],
+            capture_output=True, text=True, timeout=15, env=env
+        )
+        if res.returncode == 0 and "ok" in res.stdout:
+            HAS_FREECAD = True
+            _freecad_python = py
+            logger.info(f"FreeCAD available via: {py}")
+            return True
+    except Exception as e:
+        logger.debug(f"FreeCAD discovery failed: {e}")
+
+    logger.warning("FreeCAD / OpenCascade not found on this system.")
     return False
 
-# Trigger discovery
-discover_freecad()
 
-def is_svg_drawing_empty(svg_path):
-    """
-    Check if the exported FreeCAD TechDraw SVG page is empty (i.e. contains no actual drawing shapes in 'DrawingContent' group).
-    This handles cases like 2D wireframe drawings where TechDraw HLR projects nothing.
-    """
-    if not os.path.exists(svg_path):
-        return True
-    try:
-        import xml.etree.ElementTree as ET
-        tree = ET.parse(svg_path)
-        root = tree.getroot()
-        
-        drawing_content_group = None
-        for elem in root.iter():
-            # Extract local name to handle XML namespaces
-            local_name = elem.tag.split('}')[-1]
-            if local_name == 'g' and elem.attrib.get('id') == 'DrawingContent':
-                drawing_content_group = elem
-                break
-                
-        if drawing_content_group is None:
-            # If DrawingContent doesn't exist, assume not empty to avoid false alarms
-            return False
-            
-        # Count graphic elements within DrawingContent recursively
-        shapes = 0
-        for child in drawing_content_group.iter():
-            local_name = child.tag.split('}')[-1]
-            if local_name in ('path', 'line', 'circle', 'rect', 'polygon', 'polyline', 'ellipse'):
-                shapes += 1
-                
-        logger.info(f"Verified SVG drawing content: found {shapes} shapes inside 'DrawingContent'.")
-        return shapes == 0
-    except Exception as e:
-        logger.error(f"Error checking SVG drawing emptiness: {e}")
-        # On XML parsing error, return True to trigger fallback
-        return True
+_discover_freecad()
 
-def fit_and_scale_geometries(lines_group, circles_group, bolt_holes_group, target_center, max_size=60):
-    """
-    Fit and scale all lines, circles, and bolt holes uniformly inside a view bounding box.
-    """
-    pts = []
-    for l in lines_group:
-        pts.append(l["start"])
-        pts.append(l["end"])
-    for c in circles_group:
-        cx, cy = c["center"]
-        r = c["radius"]
-        pts.append((cx - r, cy - r))
-        pts.append((cx + r, cy + r))
-    for bh in bolt_holes_group:
-        cx, cy = bh["center"]
-        r = bh["radius"]
-        pts.append((cx - r, cy - r))
-        pts.append((cx + r, cy + r))
-        
-    if not pts:
-        return [], [], [], 0, 0
-        
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    
-    w_box = max_x - min_x
-    h_box = max_y - min_y
-    cx = min_x + w_box / 2
-    cy = min_y + h_box / 2
-    
-    curr_max = max(w_box, h_box)
-    scale = max_size / curr_max if curr_max > 0 else 1.0
-    
-    fitted_lines = []
-    for l in lines_group:
-        x1 = target_center[0] + (l["start"][0] - cx) * scale
-        y1 = target_center[1] + (l["start"][1] - cy) * scale
-        x2 = target_center[0] + (l["end"][0] - cx) * scale
-        y2 = target_center[1] + (l["end"][1] - cy) * scale
-        fitted_lines.append({
-            "start": (x1, y1),
-            "end": (x2, y2),
-            "style": l["style"]
-        })
-        
-    fitted_circles = []
-    for c in circles_group:
-        x = target_center[0] + (c["center"][0] - cx) * scale
-        y = target_center[1] + (c["center"][1] - cy) * scale
-        fitted_circles.append({
-            "center": (x, y),
-            "radius": c["radius"] * scale,
-            "style": c["style"]
-        })
-        
-    fitted_bolt_holes = []
-    for bh in bolt_holes_group:
-        x = target_center[0] + (bh["center"][0] - cx) * scale
-        y = target_center[1] + (bh["center"][1] - cy) * scale
-        fitted_bolt_holes.append({
-            "center": (x, y),
-            "radius": bh["radius"] * scale,
-            "style": bh["style"]
-        })
-        
-    return fitted_lines, fitted_circles, fitted_bolt_holes, w_box * scale, h_box * scale
 
-def project_3d_cad_in_process(file_path, views):
-    """
-    Spawns a subprocess to project the 3D CAD model in console mode (headless)
-    and loads the resulting geometry JSON metadata.
-    This protects the parent process from C++ segfaults on corrupt files.
-    """
-    import subprocess
-    import json
-    
-    logger.info(f"Isolated headless projection subprocess for {file_path}")
-    
-    # We will write temporary args.json and output paths
-    out_dir = os.path.dirname(os.path.abspath(file_path))
-    temp_out_base = os.path.join(out_dir, "headless_tmp")
-    result_json_path = temp_out_base + "_result.json"
-    
-    # Clean up old temporary files if they exist
-    if os.path.exists(result_json_path):
-        try:
-            os.remove(result_json_path)
-        except Exception:
-            pass
-            
-    args_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'freecad_args.json')
-    config = {
-        "input_file": os.path.abspath(file_path),
-        "output_file": temp_out_base,
-        "views": views
-    }
-    
-    # Standard python executable running this script
-    py_exec = sys.executable
-    
-    # If running inside Streamlit which uses custom FreeCAD resources
-    # verify if a custom python is packaged with FreeCAD
-    if sys.platform == "darwin":
-        fc_py = "/Applications/FreeCAD.app/Contents/Resources/bin/python"
-        if os.path.exists(fc_py):
-            py_exec = fc_py
-            
-    projector_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "freecad_projector_headless.py")
-    
-    cmd = [py_exec, projector_script]
-    
-    try:
-        with open(args_path, 'w') as f:
-            json.dump(config, f, indent=2)
-            
-        logger.info(f"Executing: {' '.join(cmd)}")
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        
-        # Check result
-        if res.returncode != 0 or not os.path.exists(result_json_path):
-            raise RuntimeError(
-                f"Subprocess projection failed (exit code: {res.returncode}). \n"
-                f"Stdout: {res.stdout}\nStderr: {res.stderr}"
-            )
-            
-        with open(result_json_path, 'r') as f_res:
-            geometry_data = json.load(f_res)
-            
-        logger.info("Headless projection completed successfully!")
-        return geometry_data
-        
-    finally:
-        # Cleanup
-        if os.path.exists(args_path):
-            try:
-                os.remove(args_path)
-            except Exception:
-                pass
-        if os.path.exists(result_json_path):
-            try:
-                os.remove(result_json_path)
-            except Exception:
-                pass
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
-def project_3d_cad(file_path, output_svg_path, views=None):
+def project_3d_cad(file_path, output_svg_path, views=None, disc_pts=24):
     """
-    Project 3D views (top, front, side) of a STEP/IGS file to 2D SVG vector representation
-    using native FreeCAD / OpenCascade / TechDraw topology projections.
+    Project a 3D IGES/STEP file to 2D orthographic views using OCCT.
+
+    Parameters
+    ----------
+    file_path : str
+        Path to the input 3D CAD file (.igs / .iges / .step / .stp).
+    output_svg_path : str
+        Base output path (used to derive the result JSON filename).
+    views : list[str], optional
+        Views to generate: 'top', 'front', 'side', 'iso'.
+    disc_pts : int, optional
+        Edge discretisation density (default 24 — good balance of fidelity/speed).
+
+    Returns
+    -------
+    dict
+        geometry_data dict with views, svg_paths, dimensions, and metadata.
     """
     if views is None:
-        views = ['top', 'front', 'side']
-        
-    logger.info(f"Processing 3D CAD file: '{file_path}' (views: {views})")
-    
+        views = ["top", "front", "side"]
+
     if not HAS_FREECAD:
-        raise RuntimeError("FreeCAD / OpenCascade environment is not available on this system. Headless CAD projection failed.")
-        
-    return project_3d_cad_in_process(file_path, views)
+        raise RuntimeError(
+            "FreeCAD / OpenCascade is not available on this system. "
+            "Install FreeCAD from https://www.freecad.org/ and retry."
+        )
+
+    logger.info(f"OCCT projection: '{file_path}' views={views}")
+    return _run_occt_subprocess(file_path, output_svg_path, views, disc_pts)
+
+
+def _run_occt_subprocess(file_path, output_svg_path, views, disc_pts):
+    """
+    Execute occt_projector.py in an isolated subprocess (protects the
+    Streamlit host process from OCCT C++ crashes on corrupt files).
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    projector_script = os.path.join(script_dir, "occt_projector.py")
+
+    # Derive a unique temp output base from the requested output path
+    out_base = os.path.splitext(os.path.abspath(output_svg_path))[0]
+    result_json = out_base + "_result.json"
+
+    # Write config JSON for the subprocess
+    args_path = os.path.join(script_dir, "freecad_args.json")
+    config = {
+        "input_file":  os.path.abspath(file_path),
+        "output_file": out_base,
+        "views":       views,
+        "disc_pts":    disc_pts,
+    }
+
+    # Clean stale result file
+    if os.path.exists(result_json):
+        try:
+            os.remove(result_json)
+        except OSError:
+            pass
+
+    # Build environment with OCCT lib path
+    env = os.environ.copy()
+    lib_path = "/Applications/FreeCAD.app/Contents/Resources/lib"
+    if os.path.isdir(lib_path):
+        env["PYTHONPATH"] = lib_path + os.pathsep + env.get("PYTHONPATH", "")
+
+    try:
+        with open(args_path, "w") as f:
+            json.dump(config, f, indent=2)
+
+        logger.info(f"Spawning OCCT subprocess: {_freecad_python} {projector_script}")
+        result = subprocess.run(
+            [_freecad_python, projector_script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+
+        if result.stdout:
+            for line in result.stdout.strip().splitlines():
+                logger.info(f"[occt_projector] {line}")
+        if result.stderr:
+            for line in result.stderr.strip().splitlines():
+                logger.warning(f"[occt_projector stderr] {line}")
+
+        if result.returncode != 0 or not os.path.exists(result_json):
+            raise RuntimeError(
+                f"OCCT subprocess failed (exit {result.returncode}).\n"
+                f"stdout: {result.stdout}\nstderr: {result.stderr}"
+            )
+
+        with open(result_json, "r") as f_res:
+            geometry_data = json.load(f_res)
+
+        logger.info("OCCT projection completed successfully.")
+        return geometry_data
+
+    finally:
+        for tmp in [args_path, result_json]:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass

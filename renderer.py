@@ -60,21 +60,8 @@ def render_pipeline_output(geometry_data, output_base_path, theme_name="dark"):
     svg_path = f"{output_base_path}.svg"
     pdf_path = f"{output_base_path}.pdf"
     
-    if geometry_data.get("source") == "cad_freecad":
-        logger.info("Found native FreeCAD geometry. Keeping already generated SVG & PDF outputs.")
-        png_path = f"{output_base_path}.png"
-        try:
-            import pypdfium2 as pdfium
-            logger.info(f"Natively rendering high-resolution PNG using pypdfium2 from {pdf_path}...")
-            doc = pdfium.PdfDocument(pdf_path)
-            page = doc[0]
-            bitmap = page.render(scale=5)
-            pil_img = bitmap.to_pil()
-            pil_img.save(png_path, "PNG")
-            logger.info(f"PNG drawing successfully compiled at: {png_path}")
-        except Exception as png_err:
-            logger.warning(f"Optional PNG compilation skipped: {png_err}")
-        return svg_path, pdf_path
+    # OCCT source produces svg_paths — these are rendered in the view loop below.
+    # No early-return needed; fall through to the full renderer.
 
     logger.info(f"Rendering vector drawing. Theme: '{theme_name}' -> '{svg_path}'")
     
@@ -149,61 +136,86 @@ def render_pipeline_output(geometry_data, output_base_path, theme_name="dark"):
             # Create a group for the view
             view_group = dwg.g(id=f"view-{view_name}")
             
-            # View titles
-            title_pos = (view["center"][0], view["center"][1] - 35)
-            view_group.add(dwg.text(view["title"], insert=title_pos, font_size=4.0, fill=theme["text"], font_weight="bold", text_anchor="middle", font_family="Inter, sans-serif"))
-            
-            # Draw lines
+            # View title — place above view center
+            center_x, center_y = view["center"]
+            title_y = center_y - 38
+            view_group.add(dwg.text(
+                view["title"],
+                insert=(center_x, title_y),
+                font_size=3.5,
+                fill=theme["text"],
+                font_weight="bold",
+                text_anchor="middle",
+                font_family="Inter, sans-serif",
+            ))
+
+            # ----------------------------------------------------------------
+            # OCCT edge projection paths (svg_paths) — full fidelity wireframe
+            # ----------------------------------------------------------------
+            svg_paths = view.get("svg_paths", [])
+            if svg_paths:
+                edge_group = dwg.g(
+                    id=f"edges-{view_name}",
+                    fill="none",
+                    stroke=theme["visible"],
+                    stroke_width="0.35",
+                    stroke_linecap="round",
+                    stroke_linejoin="round",
+                )
+                for d_str in svg_paths:
+                    edge_group.add(dwg.path(d=d_str))
+                view_group.add(edge_group)
+
+            # ----------------------------------------------------------------
+            # Legacy line / circle geometry (from non-OCCT sources)
+            # ----------------------------------------------------------------
             for line in view.get("lines", []):
                 style = line.get("style", "visible")
-                stroke_color = theme[style]
+                stroke_color = theme.get(style, theme["visible"])
                 stroke_w = 0.5 if style == "visible" else 0.25
                 dasharray = [3, 2] if style == "hidden" else ([6, 3, 1, 3] if style == "center" else None)
-                
                 line_kwargs = {
                     "start": line["start"],
                     "end": line["end"],
                     "stroke": stroke_color,
-                    "stroke_width": stroke_w
+                    "stroke_width": stroke_w,
                 }
                 if dasharray:
                     line_kwargs["stroke_dasharray"] = dasharray
                 view_group.add(dwg.line(**line_kwargs))
                 
-            # Draw circles
             for circle in view.get("circles", []):
                 style = circle.get("style", "visible")
-                stroke_color = theme[style]
+                stroke_color = theme.get(style, theme["visible"])
                 stroke_w = 0.5 if style == "visible" else 0.25
                 dasharray = [6, 3, 1, 3] if style == "center" else None
-                
                 circle_kwargs = {
                     "center": circle["center"],
                     "r": circle["radius"],
                     "fill": "none",
                     "stroke": stroke_color,
-                    "stroke_width": stroke_w
+                    "stroke_width": stroke_w,
                 }
                 if dasharray:
                     circle_kwargs["stroke_dasharray"] = dasharray
                 view_group.add(dwg.circle(**circle_kwargs))
                 
-            # Draw bolt holes (Path A specialized)
             for hole in view.get("bolt_holes", []):
                 view_group.add(dwg.circle(
                     center=hole["center"],
                     r=hole["radius"],
                     fill="none",
                     stroke=theme["bolt"],
-                    stroke_width=0.4
+                    stroke_width=0.4,
                 ))
-                # Add crosshairs for bolt holes
                 hc = hole["center"]
                 hr = hole["radius"]
                 view_group.add(dwg.line(start=(hc[0] - hr - 2, hc[1]), end=(hc[0] + hr + 2, hc[1]), stroke=theme["center"], stroke_width=0.15))
                 view_group.add(dwg.line(start=(hc[0], hc[1] - hr - 2), end=(hc[0], hc[1] + hr + 2), stroke=theme["center"], stroke_width=0.15))
-                
-            # Draw dimensions
+
+            # ----------------------------------------------------------------
+            # Dimension annotations
+            # ----------------------------------------------------------------
             for dim in view.get("dimensions", []):
                 draw_dimension_callout(dwg, view_group, dim, theme)
                 
