@@ -126,12 +126,26 @@ def main():
     
     doc = FreeCAD.newDocument("HeadlessProjectionDoc")
     try:
-        Import.insert(input_file, doc.Name)
+        try:
+            Import.insert(input_file, doc.Name)
+        except Exception as e:
+            print("Import.insert failed:", e)
         
         shapes = []
         for obj in doc.Objects:
             if hasattr(obj, 'Shape') and obj.Shape is not None and not obj.Shape.isNull():
                 shapes.append(obj.Shape)
+                
+        if not shapes:
+            print("No shapes found in doc via Import.insert. Falling back to Part.read...")
+            try:
+                shape = Part.read(input_file)
+                if shape is not None and not shape.isNull():
+                    obj = doc.addObject("Part::Feature", "ImportedShape")
+                    obj.Shape = shape
+                    shapes.append(obj.Shape)
+            except Exception as e:
+                print("Part.read failed:", e)
                 
         if not shapes:
             raise ValueError("No valid 3D shapes found.")

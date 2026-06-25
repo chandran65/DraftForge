@@ -37,9 +37,23 @@ import TechDrawGui
 
 doc = FreeCAD.newDocument("ProjectionDoc")
 print("Loading 3D CAD model...")
-Import.insert(input_file, doc.Name)
+try:
+    Import.insert(input_file, doc.Name)
+except Exception as e:
+    print("Import.insert failed:", e)
 
 imported_objects = doc.Objects
+if not imported_objects:
+    print("No objects found in doc via Import.insert. Falling back to Part.read...")
+    try:
+        shape = Part.read(input_file)
+        if shape is not None and not shape.isNull():
+            obj = doc.addObject("Part::Feature", "ImportedShape")
+            obj.Shape = shape
+            imported_objects = [obj]
+    except Exception as e:
+        print("Part.read failed:", e)
+
 if not imported_objects:
     print("Error: No imported solid found.")
     sys.exit(1)
