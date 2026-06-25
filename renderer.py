@@ -127,38 +127,82 @@ def render_pipeline_output(geometry_data, output_base_path, theme_name="dark"):
     title_block.add(dwg.text("SCALE: 1:1  [A4]", insert=(tb_x + 65, tb_y + 26), font_size=2.8, fill=theme["title_text"], font_family="Inter, sans-serif"))
     
     dwg.add(title_block)
-    
+
+    # ── Shading colour helper ────────────────────────────────────────────────
+    def _intensity_to_hex(intensity: float, dark: bool) -> str:
+        """Map [0,1] intensity to a fill colour for shaded faces."""
+        i = max(0.0, min(1.0, intensity))
+        if dark:
+            # Dark navy (#0D1B2A) → bright cyan-blue (#38BDF8)
+            r = int(13  + i * (56  - 13))
+            g = int(27  + i * (189 - 27))
+            b = int(42  + i * (248 - 42))
+        else:
+            # Warm-white engineering paper: very dark slate → near-white
+            r = int(40  + i * 215)
+            g = int(55  + i * 200)
+            b = int(75  + i * 180)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    is_dark = (theme == THEMES["dark"])
+
     # 5. Render Geometry Objects
-    # If the source is CAD (has views) vs single-drawing raster/vector PDF
+    render_mode = geometry_data.get("render_mode", "2d_wireframe")
+
     if "views" in geometry_data:
-        # Multi-view rendering
         for view_name, view in geometry_data["views"].items():
-            # Create a group for the view
             view_group = dwg.g(id=f"view-{view_name}")
-            
-            # View title — place above view center
+
+            # View title
             center_x, center_y = view["center"]
-            title_y = center_y - 38
+            title_y = center_y - 55
             view_group.add(dwg.text(
                 view["title"],
                 insert=(center_x, title_y),
-                font_size=3.5,
+                font_size=4.0,
                 fill=theme["text"],
                 font_weight="bold",
                 text_anchor="middle",
                 font_family="Inter, sans-serif",
             ))
 
-            # ----------------------------------------------------------------
-            # OCCT edge projection paths (svg_paths) — full fidelity wireframe
-            # ----------------------------------------------------------------
+            # ── 1. Shaded faces (flat / smooth shading modes) ────────────────
+            faces = view.get("faces", [])
+            if faces and render_mode in ("3d_flat_shading", "3d_smooth_shading"):
+                face_group = dwg.g(id=f"faces-{view_name}", stroke="none")
+                for tri in faces:
+                    pts = tri["pts"]
+                    fill_col = _intensity_to_hex(tri["intensity"], is_dark)
+                    # Thin edge strokes only for flat shading
+                    stroke_col = "none"
+                    sw = "0"
+                    if render_mode == "3d_flat_shading" and not tri.get("back_facing"):
+                        stroke_col = theme["visible"]
+                        sw = "0.08"
+                    face_group.add(dwg.polygon(
+                        points=[(p[0], p[1]) for p in pts],
+                        fill=fill_col,
+                        stroke=stroke_col,
+                        stroke_width=sw,
+                    ))
+                view_group.add(face_group)
+
+            # ── 2. Visible edges (svg_paths) ─────────────────────────────────
             svg_paths = view.get("svg_paths", [])
             if svg_paths:
+                # Stroke weight depends on mode
+                if render_mode == "3d_wireframe":
+                    sw = "0.55"   # front / close edges: thicker
+                elif render_mode in ("3d_flat_shading",):
+                    sw = "0.25"   # overlay on shaded faces: thin
+                else:
+                    sw = "0.35"   # 2D wireframe, hidden lines visible part
+
                 edge_group = dwg.g(
                     id=f"edges-{view_name}",
                     fill="none",
                     stroke=theme["visible"],
-                    stroke_width="0.35",
+                    stroke_width=sw,
                     stroke_linecap="round",
                     stroke_linejoin="round",
                 )
@@ -166,60 +210,70 @@ def render_pipeline_output(geometry_data, output_base_path, theme_name="dark"):
                     edge_group.add(dwg.path(d=d_str))
                 view_group.add(edge_group)
 
-            # ----------------------------------------------------------------
-            # Legacy line / circle geometry (from non-OCCT sources)
-            # ----------------------------------------------------------------
+            # ── 3. Hidden / back edges ────────────────────────────────────────
+            hidden_paths = view.get("hidden_svg_paths", [])
+            if hidden_paths:
+                if render_mode == "3d_hidden_lines":
+                    # Dashed style for true hidden-line representation
+                    h_stroke = theme["hidden"]
+                    h_sw     = "0.2"
+                    h_dash   = "2,2"
+                elif render_mode == "3d_wireframe":
+                    # Thinner solid for back edges (depth cueing)
+                    h_stroke = theme["visible"]
+                    h_sw     = "0.15"
+                    h_dash   = None
+                else:
+                    h_stroke = h_sw = h_dash = None  # skip
+
+                if h_stroke:
+                    hkw = dict(
+                        id=f"hidden-{view_name}",
+                        fill="none",
+                        stroke=h_stroke,
+                        stroke_width=h_sw,
+                        stroke_linecap="round",
+                    )
+                    if h_dash:
+                        hkw["stroke_dasharray"] = h_dash
+                    hidden_group = dwg.g(**hkw)
+                    for d_str in hidden_paths:
+                        hidden_group.add(dwg.path(d=d_str))
+                    view_group.add(hidden_group)
+
+            # ── 4. Legacy line / circle geometry (PDF / raster path) ─────────
             for line in view.get("lines", []):
                 style = line.get("style", "visible")
-                stroke_color = theme.get(style, theme["visible"])
-                stroke_w = 0.5 if style == "visible" else 0.25
-                dasharray = [3, 2] if style == "hidden" else ([6, 3, 1, 3] if style == "center" else None)
-                line_kwargs = {
-                    "start": line["start"],
-                    "end": line["end"],
-                    "stroke": stroke_color,
-                    "stroke_width": stroke_w,
-                }
-                if dasharray:
-                    line_kwargs["stroke_dasharray"] = dasharray
-                view_group.add(dwg.line(**line_kwargs))
-                
+                sc = theme.get(style, theme["visible"])
+                sw = 0.5 if style == "visible" else 0.25
+                da = [3, 2] if style == "hidden" else ([6, 3, 1, 3] if style == "center" else None)
+                kw = {"start": line["start"], "end": line["end"], "stroke": sc, "stroke_width": sw}
+                if da:
+                    kw["stroke_dasharray"] = da
+                view_group.add(dwg.line(**kw))
+
             for circle in view.get("circles", []):
                 style = circle.get("style", "visible")
-                stroke_color = theme.get(style, theme["visible"])
-                stroke_w = 0.5 if style == "visible" else 0.25
-                dasharray = [6, 3, 1, 3] if style == "center" else None
-                circle_kwargs = {
-                    "center": circle["center"],
-                    "r": circle["radius"],
-                    "fill": "none",
-                    "stroke": stroke_color,
-                    "stroke_width": stroke_w,
-                }
-                if dasharray:
-                    circle_kwargs["stroke_dasharray"] = dasharray
-                view_group.add(dwg.circle(**circle_kwargs))
-                
-            for hole in view.get("bolt_holes", []):
-                view_group.add(dwg.circle(
-                    center=hole["center"],
-                    r=hole["radius"],
-                    fill="none",
-                    stroke=theme["bolt"],
-                    stroke_width=0.4,
-                ))
-                hc = hole["center"]
-                hr = hole["radius"]
-                view_group.add(dwg.line(start=(hc[0] - hr - 2, hc[1]), end=(hc[0] + hr + 2, hc[1]), stroke=theme["center"], stroke_width=0.15))
-                view_group.add(dwg.line(start=(hc[0], hc[1] - hr - 2), end=(hc[0], hc[1] + hr + 2), stroke=theme["center"], stroke_width=0.15))
+                sc = theme.get(style, theme["visible"])
+                sw = 0.5 if style == "visible" else 0.25
+                kw = {"center": circle["center"], "r": circle["radius"], "fill": "none", "stroke": sc, "stroke_width": sw}
+                if style == "center":
+                    kw["stroke_dasharray"] = [6, 3, 1, 3]
+                view_group.add(dwg.circle(**kw))
 
-            # ----------------------------------------------------------------
-            # Dimension annotations
-            # ----------------------------------------------------------------
+            for hole in view.get("bolt_holes", []):
+                hc, hr = hole["center"], hole["radius"]
+                view_group.add(dwg.circle(center=hc, r=hr, fill="none", stroke=theme["bolt"], stroke_width=0.4))
+                view_group.add(dwg.line(start=(hc[0]-hr-2, hc[1]), end=(hc[0]+hr+2, hc[1]), stroke=theme["center"], stroke_width=0.15))
+                view_group.add(dwg.line(start=(hc[0], hc[1]-hr-2), end=(hc[0], hc[1]+hr+2), stroke=theme["center"], stroke_width=0.15))
+
+            # ── 5. Dimension annotations ──────────────────────────────────────
             for dim in view.get("dimensions", []):
                 draw_dimension_callout(dwg, view_group, dim, theme)
-                
+
             dwg.add(view_group)
+
+
             
     else:
         # Drawing mode (single layout)

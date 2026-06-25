@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
-occt_projector.py — True OCCT Edge Projection Engine
+occt_projector.py — True OCCT Edge + Face Projection Engine
 
-Uses FreeCAD's Part module (OpenCascade Technology backend) to:
-1. Load IGES/STEP files using Part.read() — gets all faces/edges/curves
-2. Discretize every 3D edge into polyline points
-3. Project to true orthographic 2D views (top, front, side, iso)
-4. Emit structured geometry_data dict (lines + circles) for the renderer
-
-This is a subprocess-safe script — designed to be called from cad_parser.py
-via subprocess with a config JSON and write a result JSON.
+Supports 6 view directions and 5 render modes:
+  Views:  initial (top-down), bottom, front, back, left, right
+  Modes:  2d_wireframe, 3d_wireframe, 3d_hidden_lines,
+          3d_flat_shading, 3d_smooth_shading
 """
 
 import os
@@ -22,7 +18,6 @@ import time
 # Bootstrap FreeCAD lib path
 # ---------------------------------------------------------------------------
 def _discover_freecad():
-    """Find and prepend the FreeCAD lib directory to sys.path."""
     env_path = os.environ.get("FREECAD_LIB_PATH")
     candidates = []
     if env_path:
@@ -32,26 +27,22 @@ def _discover_freecad():
             "/Applications/FreeCAD.app/Contents/Resources/lib",
             "/Applications/FreeCAD.app/Contents/lib",
             "/opt/homebrew/lib",
-            "/opt/homebrew/opt/freecad/lib",
         ]
     elif sys.platform.startswith("linux"):
         candidates += [
             "/usr/lib/freecad/lib",
             "/usr/lib/freecad-python3/lib",
             "/usr/lib/freecad-daily/lib",
-            "/usr/share/freecad/lib",
         ]
     elif sys.platform == "win32":
         candidates += [
             r"C:\Program Files\FreeCAD\bin",
             r"C:\Program Files\FreeCAD\lib",
         ]
-
     for p in candidates:
         if os.path.isdir(p):
             if p not in sys.path:
                 sys.path.insert(0, p)
-            # Verify FreeCAD is importable from this path
             try:
                 import FreeCAD  # noqa: F401
                 return True
@@ -63,83 +54,177 @@ def _discover_freecad():
 _discover_freecad()
 
 # ---------------------------------------------------------------------------
-# Projection utilities
+# Constants
 # ---------------------------------------------------------------------------
-# Discretisation density (points per edge).  Higher = smoother curves.
-DISC_POINTS = 24
+DISC_POINTS   = 24     # edge discretisation density
+TESS_PREC     = 0.3    # mm face tessellation accuracy
 
+# Single view: centred on A4 landscape with room for title block
+VIEW_CENTER  = (130, 92)
+VIEW_MAX_DIM = 130      # mm — fills most of the sheet
 
+VIEW_TITLES = {
+    "initial": "TOP VIEW (INITIAL)",
+    "bottom":  "BOTTOM VIEW",
+    "front":   "FRONT VIEW",
+    "back":    "BACK VIEW",
+    "left":    "LEFT SIDE VIEW",
+    "right":   "RIGHT SIDE VIEW",
+}
+
+# Camera direction: unit vector pointing FROM the camera TOWARD the scene
+VIEW_CAM_DIR = {
+    "initial": (0,  0, -1),  # above, looking down
+    "bottom":  (0,  0,  1),  # below, looking up
+    "front":   (0, -1,  0),  # front, looking back  (+Y into scene)
+    "back":    (0,  1,  0),  # rear,  looking fwd   (-Y into scene)
+    "left":    (-1, 0,  0),  # left,  looking right (+X into scene)
+    "right":   (1,  0,  0),  # right, looking left  (-X into scene)
+}
+
+# ---------------------------------------------------------------------------
+# Projection helpers
+# ---------------------------------------------------------------------------
 def _project_pt(p, view: str):
-    """
-    Project a 3D FreeCAD Vector to 2D (x, y) canvas coordinates.
-    Convention: +X = right, +Y = down on canvas.
-    """
-    if view == "front":   # camera at -Y, looking +Y  →  canvas (X, -Z)
-        return (p.x, -p.z)
-    elif view == "top":   # camera at +Z, looking -Z  →  canvas (X, -Y)
-        return (p.x, -p.y)
-    elif view == "side":  # camera at +X, looking -X  →  canvas (-Y, -Z)
-        return (-p.y, -p.z)
-    elif view == "iso":   # standard isometric 30° projection
-        a = math.radians(30)
-        return (
-            (p.x - p.y) * math.cos(a),
-            -(p.x + p.y) * math.sin(a) - p.z,
-        )
+    """Project 3D FreeCAD Vector → 2D canvas (x, y).  +X=right, +Y=down."""
+    if view == "initial":
+        return ( p.x, -p.y)   # top-down: X→X, Y→-Y (flip so +Y goes up on canvas)
+    elif view == "bottom":
+        return ( p.x,  p.y)   # bottom-up: X→X, Y→Y (Y already down)
+    elif view == "front":
+        return ( p.x, -p.z)   # front: X→X, Z→-Z
+    elif view == "back":
+        return (-p.x, -p.z)   # back:  mirror X
+    elif view == "left":
+        return ( p.y, -p.z)   # left side: Y→X, Z→-Z
+    elif view == "right":
+        return (-p.y, -p.z)   # right side: -Y→X, Z→-Z
     else:
-        return (p.x, -p.z)
+        return ( p.x, -p.z)
 
 
-def _discretize_edge(edge, view: str, n: int = DISC_POINTS):
-    """
-    Discretize a Part Edge into projected 2D polyline points.
-    Returns list of (x, y) tuples.
-    """
-    try:
-        pts_3d = edge.discretize(n)
-    except Exception:
-        # Fallback: use endpoint vertices only
-        try:
-            pts_3d = [v.Point for v in edge.Vertexes]
-        except Exception:
-            return []
-    return [_project_pt(p, view) for p in pts_3d]
+def _depth_pt(p, view: str) -> float:
+    """Depth along view axis. Higher = closer to camera (drawn last in painter's sort)."""
+    if view == "initial":  return  p.z
+    elif view == "bottom": return -p.z
+    elif view == "front":  return -p.y
+    elif view == "back":   return  p.y
+    elif view == "left":   return -p.x
+    elif view == "right":  return  p.x
+    else:                  return -p.y
 
 
-def _edges_to_svg_paths(edges, view: str, n: int = DISC_POINTS):
+# ---------------------------------------------------------------------------
+# Edge processing
+# ---------------------------------------------------------------------------
+def _edges_to_data(edges, view: str, n: int = DISC_POINTS):
     """
-    Convert a list of Part Edges to SVG <path d="..."> strings.
-    Returns a list of 'd' attribute strings.
+    Returns list of (d_string, avg_depth) for every edge.
+    d_string: SVG path 'd' attribute  →  'M x,y L x,y ...'
+    avg_depth: mean depth along view axis (higher = closer to camera)
     """
-    paths = []
+    result = []
     for edge in edges:
-        pts = _discretize_edge(edge, view, n)
-        if len(pts) < 2:
+        try:
+            pts_3d = edge.discretize(n)
+        except Exception:
+            try:
+                pts_3d = [v.Point for v in edge.Vertexes]
+            except Exception:
+                continue
+        if len(pts_3d) < 2:
             continue
-        d = f"M {pts[0][0]:.4f},{pts[0][1]:.4f}"
-        for pt in pts[1:]:
+        pts_2d = [_project_pt(p, view) for p in pts_3d]
+        avg_depth = sum(_depth_pt(p, view) for p in pts_3d) / len(pts_3d)
+        d = f"M {pts_2d[0][0]:.4f},{pts_2d[0][1]:.4f}"
+        for pt in pts_2d[1:]:
             d += f" L {pt[0]:.4f},{pt[1]:.4f}"
-        paths.append(d)
-    return paths
+        result.append((d, float(avg_depth)))
+    return result
 
 
-def _compute_bbox(svg_paths):
-    """Return (min_x, min_y, max_x, max_y) from a list of SVG path d strings.
-
-    Each path uses the format: 'M x,y L x,y L x,y ...'
-    Coordinates are comma-separated pairs separated by spaces after command letters.
+# ---------------------------------------------------------------------------
+# Face tessellation (for shading modes)
+# ---------------------------------------------------------------------------
+def _tessellate_faces(shape, view: str, precision: float = TESS_PREC):
     """
+    Tessellate all Shape faces, project triangles to 2D, compute shading.
+    Returns list of dicts: {pts_2d, intensity, depth, back_facing}
+    """
+    cam = VIEW_CAM_DIR.get(view, (0, -1, 0))
+
+    # Key light: offset from camera so it's not flat-lit
+    lx = -cam[0] * 0.3 + 0.5
+    ly = -cam[1] * 0.3 - 0.4
+    lz = -cam[2] * 0.5 + 0.7
+    lmag = math.sqrt(lx * lx + ly * ly + lz * lz) + 1e-10
+    lx /= lmag;  ly /= lmag;  lz /= lmag
+
+    triangles = []
+    for face in shape.Faces:
+        try:
+            pts_3d, tris = face.tessellate(precision)
+        except Exception:
+            continue
+        for tri in tris:
+            try:
+                v0, v1, v2 = pts_3d[tri[0]], pts_3d[tri[1]], pts_3d[tri[2]]
+            except IndexError:
+                continue
+
+            # Project to 2D canvas
+            p0 = _project_pt(v0, view)
+            p1 = _project_pt(v1, view)
+            p2 = _project_pt(v2, view)
+
+            # Triangle normal (cross product of edges in 3D)
+            e1 = (v1.x - v0.x, v1.y - v0.y, v1.z - v0.z)
+            e2 = (v2.x - v0.x, v2.y - v0.y, v2.z - v0.z)
+            nx = e1[1] * e2[2] - e1[2] * e2[1]
+            ny = e1[2] * e2[0] - e1[0] * e2[2]
+            nz = e1[0] * e2[1] - e1[1] * e2[0]
+            nmag = math.sqrt(nx * nx + ny * ny + nz * nz) + 1e-10
+            nx /= nmag;  ny /= nmag;  nz /= nmag
+
+            # Back-face test: dot(normal, cam_direction) > 0 → back-facing
+            dot_cam = nx * cam[0] + ny * cam[1] + nz * cam[2]
+            back_facing = dot_cam > 0.05
+
+            # Diffuse lighting + ambient
+            dot_light = nx * lx + ny * ly + nz * lz
+            if back_facing:
+                intensity = 0.12   # back face: very dark
+            else:
+                intensity = max(0.0, dot_light) * 0.75 + 0.25
+
+            # Average depth for painter's algorithm
+            depth = (
+                _depth_pt(v0, view) + _depth_pt(v1, view) + _depth_pt(v2, view)
+            ) / 3.0
+
+            triangles.append({
+                "pts":         [list(p0), list(p1), list(p2)],
+                "intensity":   float(intensity),
+                "depth":       float(depth),
+                "back_facing": bool(back_facing),
+            })
+
+    # Painter's algorithm: draw far-away triangles first
+    triangles.sort(key=lambda t: t["depth"])
+    return triangles
+
+
+# ---------------------------------------------------------------------------
+# Normalization
+# ---------------------------------------------------------------------------
+def _compute_bbox(svg_paths):
     xs, ys = [], []
     for d in svg_paths:
-        # Strip command letters, then split on spaces/commas
         cleaned = d.replace("M", " ").replace("L", " ").strip()
-        # Each coordinate pair is 'x,y'
         for pair in cleaned.split():
             try:
-                parts = pair.split(",")
-                if len(parts) == 2:
-                    xs.append(float(parts[0]))
-                    ys.append(float(parts[1]))
+                px, py = pair.split(",")
+                xs.append(float(px));  ys.append(float(py))
             except ValueError:
                 pass
     if not xs:
@@ -147,14 +232,8 @@ def _compute_bbox(svg_paths):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def _normalize_paths(svg_paths, center, max_dim=70):
-    """
-    Fit all SVG paths into a box of `max_dim` mm centred at `center`.
-    Returns list of rescaled path d strings.
-    """
-    if not svg_paths:
-        return []
-
+def _get_norm_params(svg_paths, center, max_dim):
+    """Return (cx_src, cy_src, scale, cx_dst, cy_dst)."""
     min_x, min_y, max_x, max_y = _compute_bbox(svg_paths)
     w = max_x - min_x
     h = max_y - min_y
@@ -162,249 +241,221 @@ def _normalize_paths(svg_paths, center, max_dim=70):
     cy_src = min_y + h / 2
     span = max(w, h, 1e-6)
     scale = max_dim / span
-
     cx_dst, cy_dst = center
+    return cx_src, cy_src, scale, cx_dst, cy_dst
 
-    def rescale(d: str) -> str:
+
+def _norm_pt(x, y, cx_src, cy_src, scale, cx_dst, cy_dst):
+    return (cx_dst + (x - cx_src) * scale, cy_dst + (y - cy_src) * scale)
+
+
+def _norm_paths(paths, *np):
+    def rescale(d):
         tokens = d.split()
         out = []
-        cmd = None
         i = 0
         while i < len(tokens):
             t = tokens[i]
             if t in ("M", "L"):
-                cmd = t
-                out.append(t)
-                i += 1
+                out.append(t); i += 1
             else:
                 try:
-                    raw_x, raw_y = t.split(",")
-                    rx = float(raw_x)
-                    ry = float(raw_y)
-                    nx = cx_dst + (rx - cx_src) * scale
-                    ny = cy_dst + (ry - cy_src) * scale
+                    rx, ry = t.split(",")
+                    nx, ny = _norm_pt(float(rx), float(ry), *np)
                     out.append(f"{nx:.3f},{ny:.3f}")
                 except Exception:
                     out.append(t)
                 i += 1
         return " ".join(out)
+    return [rescale(d) for d in paths]
 
-    return [rescale(d) for d in svg_paths]
 
-
-# ---------------------------------------------------------------------------
-# View layout constants (A4 Landscape: 297 × 210 mm)
-# Layout: top-left = TOP, bottom-left = FRONT, top-right = ISO, bottom-right = SIDE
-# ---------------------------------------------------------------------------
-VIEW_CENTERS = {
-    "top":   (80,  75),    # upper-left quadrant
-    "front": (80, 165),    # lower-left quadrant
-    "side":  (195, 165),   # lower-right quadrant
-    "iso":   (195,  75),   # upper-right quadrant
-}
-VIEW_MAX_DIM = {
-    "top":   75,
-    "front": 65,
-    "side":  65,
-    "iso":   70,
-}
-VIEW_TITLES = {
-    "top":   "TOP VIEW",
-    "front": "FRONT VIEW",
-    "side":  "RIGHT SIDE VIEW",
-    "iso":   "ISOMETRIC VIEW",
-}
+def _norm_faces(faces, *np):
+    result = []
+    for f in faces:
+        norm_pts = [list(_norm_pt(p[0], p[1], *np)) for p in f["pts"]]
+        result.append({
+            "pts":         norm_pts,
+            "intensity":   f["intensity"],
+            "depth":       f["depth"],
+            "back_facing": f["back_facing"],
+        })
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Main projection function
 # ---------------------------------------------------------------------------
-def project_iges_step(input_file: str, views=None, disc_pts: int = DISC_POINTS):
-    """
-    Load an IGES or STEP file and project all edges to 2D SVG path data
-    for each requested view.
-
-    Returns geometry_data dict compatible with DraftForge renderer.
-    """
-    if views is None:
-        views = ["top", "front", "side"]
-
-    import FreeCAD
+def project_iges_step(
+    input_file: str,
+    view_name: str = "front",
+    render_mode: str = "2d_wireframe",
+    disc_pts: int = DISC_POINTS,
+):
+    import FreeCAD  # noqa: F401
     import Part
 
-    t_start = time.time()
-    print(f"[occt_projector] Loading: {input_file}", flush=True)
+    t0 = time.time()
+    print(f"[occt] Loading: {input_file}", flush=True)
+    print(f"[occt] View: {view_name}  |  Mode: {render_mode}", flush=True)
 
     # ---- Load shape --------------------------------------------------------
     shape = Part.read(input_file)
     if shape is None or shape.isNull():
-        raise ValueError(f"Part.read() returned empty/null shape for: {input_file}")
+        raise ValueError(f"Part.read() returned null shape: {input_file}")
 
-    edges = shape.Edges
-    if not edges:
-        raise ValueError("No edges found in shape after loading.")
-
-    bbox = shape.BoundBox
+    edges  = shape.Edges
+    bbox   = shape.BoundBox
     model_w = bbox.XLength
     model_h = bbox.YLength
     model_d = bbox.ZLength
 
     print(
-        f"[occt_projector] Loaded {len(edges)} edges | "
-        f"Faces: {len(shape.Faces)} | "
-        f"BBox: {model_w:.2f}W × {model_d:.2f}D × {model_h:.2f}H mm",
+        f"[occt] {len(edges)} edges | {len(shape.Faces)} faces | "
+        f"BBox {model_w:.2f}W × {model_d:.2f}D × {model_h:.2f}H mm",
         flush=True,
     )
 
-    # ---- Build geometry_data -----------------------------------------------
-    geometry_data = {
-        "source": "cad_occt_edge_projection",
-        "file_name": os.path.basename(input_file),
-        "width": 297,
-        "height": 210,
-        "views": {},
+    center  = VIEW_CENTER
+    max_dim = VIEW_MAX_DIM
+
+    # ---- Project edges -----------------------------------------------------
+    edge_data  = _edges_to_data(edges, view_name, disc_pts)
+    all_paths  = [d for d, _ in edge_data]
+    all_depths = [dep for _, dep in edge_data]
+
+    if not all_paths:
+        raise ValueError("No projected edges for this view.")
+
+    # ---- Normalization parameters (derived from all edges) -----------------
+    np_params = _get_norm_params(all_paths, center, max_dim)
+
+    # ---- Classify edges for 3D wireframe / hidden lines --------------------
+    visible_paths = []
+    hidden_paths  = []
+
+    if render_mode in ("3d_wireframe", "3d_hidden_lines") and all_depths:
+        # Top-40% by depth = visible (closer to camera); bottom-60% = hidden
+        sorted_d = sorted(all_depths)
+        threshold = sorted_d[int(len(sorted_d) * 0.40)]
+        vis_raw = [d for d, dep in edge_data if dep >= threshold]
+        hid_raw = [d for d, dep in edge_data if dep <  threshold]
+        visible_paths = _norm_paths(vis_raw, *np_params)
+        hidden_paths  = _norm_paths(hid_raw, *np_params)
+    else:
+        visible_paths = _norm_paths(all_paths, *np_params)
+
+    # ---- Tessellate faces (shading modes) ----------------------------------
+    faces = []
+    if render_mode in ("3d_flat_shading", "3d_smooth_shading"):
+        print("[occt] Tessellating faces...", flush=True)
+        raw_faces = _tessellate_faces(shape, view_name, TESS_PREC)
+        faces = _norm_faces(raw_faces, *np_params)
+        print(f"[occt] {len(faces)} triangles tessellated", flush=True)
+        # For smooth shading, clear visible edges (faces speak for themselves)
+        if render_mode == "3d_smooth_shading":
+            visible_paths = []
+
+    # ---- View extents for dimension lines ----------------------------------
+    ref_paths = visible_paths + hidden_paths
+    if ref_paths:
+        bx_min, by_min, bx_max, by_max = _compute_bbox(ref_paths)
+        vw = bx_max - bx_min
+        vh = by_max - by_min
+    else:
+        vw = vh = max_dim * 0.8
+
+    cx, cy = center
+    dimensions = [
+        {
+            "start":  (cx - vw / 2,      cy + vh / 2 + 8),
+            "end":    (cx + vw / 2,       cy + vh / 2 + 8),
+            "text":   f"{model_w:.2f}",
+            "offset": 0,
+        },
+        {
+            "start":  (cx + vw / 2 + 8,  cy - vh / 2),
+            "end":    (cx + vw / 2 + 8,  cy + vh / 2),
+            "text":   f"{model_d:.2f}",
+            "offset": 0,
+        },
+    ]
+
+    elapsed = time.time() - t0
+    print(f"[occt] Done in {elapsed:.2f}s — {len(visible_paths)} visible, {len(hidden_paths)} hidden, {len(faces)} faces", flush=True)
+
+    return {
+        "source":      "cad_occt_edge_projection",
+        "file_name":   os.path.basename(input_file),
+        "width":       297,
+        "height":      210,
+        "render_mode": render_mode,
+        "views": {
+            view_name: {
+                "title":            VIEW_TITLES.get(view_name, view_name.upper() + " VIEW"),
+                "center":           list(center),
+                "svg_paths":        visible_paths,
+                "hidden_svg_paths": hidden_paths,
+                "faces":            faces,
+                "lines":            [],
+                "circles":          [],
+                "bolt_holes":       [],
+                "dimensions":       dimensions,
+            }
+        },
         "meta": {
             "has_freecad": True,
-            "part_type": shape.ShapeType,
-            "engine": "OpenCascade / FreeCAD Part.read + Edge discretisation",
+            "part_type":   shape.ShapeType,
+            "engine":      "OpenCascade / FreeCAD Part.read + Edge discretisation",
             "params": {
-                "Overall Width":   f"{model_w:.2f} mm",
-                "Overall Depth":   f"{model_d:.2f} mm",
-                "Overall Height":  f"{model_h:.2f} mm",
-                "Total Edges":     str(len(edges)),
-                "Total Faces":     str(len(shape.Faces)),
-                "Shape Type":      shape.ShapeType,
+                "Overall Width":  f"{model_w:.2f} mm",
+                "Overall Depth":  f"{model_d:.2f} mm",
+                "Overall Height": f"{model_h:.2f} mm",
+                "Total Edges":    str(len(edges)),
+                "Total Faces":    str(len(shape.Faces)),
+                "Shape Type":     shape.ShapeType,
+                "View":           VIEW_TITLES.get(view_name, view_name),
+                "Render Mode":    render_mode.replace("_", " ").title(),
             },
         },
     }
 
-    # ---- Project each view -------------------------------------------------
-    for view_name in views:
-        if view_name not in VIEW_CENTERS:
-            print(f"[occt_projector] Unknown view '{view_name}', skipping.", flush=True)
-            continue
-
-        center = VIEW_CENTERS[view_name]
-        max_dim = VIEW_MAX_DIM[view_name]
-
-        t_view = time.time()
-        raw_paths = _edges_to_svg_paths(edges, view_name, disc_pts)
-        norm_paths = _normalize_paths(raw_paths, center, max_dim)
-        elapsed_view = time.time() - t_view
-
-        print(
-            f"[occt_projector] View '{view_name}': {len(norm_paths)} paths in {elapsed_view:.2f}s",
-            flush=True,
-        )
-
-        # Compute view extents for dimension annotation
-        if norm_paths:
-            bx_min, by_min, bx_max, by_max = _compute_bbox(norm_paths)
-            view_w = bx_max - bx_min
-            view_h = by_max - by_min
-        else:
-            view_w = max_dim
-            view_h = max_dim
-
-        # Build dimension annotations
-        cx, cy = center
-        dimensions = []
-        if view_name == "front":
-            dimensions = [
-                {
-                    "start": (cx - view_w / 2, cy + view_h / 2 + 10),
-                    "end":   (cx + view_w / 2, cy + view_h / 2 + 10),
-                    "text":  f"{model_w:.2f}",
-                    "offset": 0,
-                },
-                {
-                    "start": (cx + view_w / 2 + 10, cy - view_h / 2),
-                    "end":   (cx + view_w / 2 + 10, cy + view_h / 2),
-                    "text":  f"{model_d:.2f}",
-                    "offset": 0,
-                },
-            ]
-        elif view_name == "top":
-            dimensions = [
-                {
-                    "start": (cx - view_w / 2, cy - view_h / 2 - 10),
-                    "end":   (cx + view_w / 2, cy - view_h / 2 - 10),
-                    "text":  f"{model_w:.2f}",
-                    "offset": 0,
-                },
-                {
-                    "start": (cx + view_w / 2 + 10, cy - view_h / 2),
-                    "end":   (cx + view_w / 2 + 10, cy + view_h / 2),
-                    "text":  f"{model_h:.2f}",
-                    "offset": 0,
-                },
-            ]
-        elif view_name == "side":
-            dimensions = [
-                {
-                    "start": (cx - view_w / 2, cy + view_h / 2 + 10),
-                    "end":   (cx + view_w / 2, cy + view_h / 2 + 10),
-                    "text":  f"{model_h:.2f}",
-                    "offset": 0,
-                },
-                {
-                    "start": (cx + view_w / 2 + 10, cy - view_h / 2),
-                    "end":   (cx + view_w / 2 + 10, cy + view_h / 2),
-                    "text":  f"{model_d:.2f}",
-                    "offset": 0,
-                },
-            ]
-
-        geometry_data["views"][view_name] = {
-            "title": VIEW_TITLES[view_name],
-            "center": center,
-            "svg_paths": norm_paths,   # raw SVG path d strings (full fidelity)
-            "lines": [],               # populated by renderer from svg_paths
-            "circles": [],
-            "bolt_holes": [],
-            "dimensions": dimensions,
-        }
-
-    t_total = time.time() - t_start
-    print(f"[occt_projector] Done in {t_total:.2f}s total", flush=True)
-    return geometry_data
-
 
 # ---------------------------------------------------------------------------
-# Subprocess entry point (called from cad_parser.py)
+# Subprocess entry point
 # ---------------------------------------------------------------------------
 def main():
     args_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "freecad_args.json")
     if not os.path.exists(args_path):
-        print("[occt_projector] ERROR: freecad_args.json not found.", file=sys.stderr)
+        print("[occt] ERROR: freecad_args.json not found.", file=sys.stderr)
         sys.exit(1)
 
     with open(args_path, "r") as f:
         config = json.load(f)
 
-    input_file = config.get("input_file")
+    input_file  = config.get("input_file")
     output_file = config.get("output_file")
-    views = config.get("views", ["top", "front", "side"])
-    disc_pts = config.get("disc_pts", DISC_POINTS)
+    view_name   = config.get("view_name",   "front")
+    render_mode = config.get("render_mode", "2d_wireframe")
+    disc_pts    = config.get("disc_pts",    DISC_POINTS)
 
     if not input_file or not os.path.exists(input_file):
-        print(f"[occt_projector] ERROR: input_file not found: {input_file}", file=sys.stderr)
+        print(f"[occt] ERROR: input_file not found: {input_file}", file=sys.stderr)
         sys.exit(1)
 
     try:
-        geometry_data = project_iges_step(input_file, views=views, disc_pts=disc_pts)
+        gd = project_iges_step(input_file, view_name, render_mode, disc_pts)
     except Exception as e:
-        print(f"[occt_projector] FATAL: {e}", file=sys.stderr)
         import traceback
+        print(f"[occt] FATAL: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         sys.exit(1)
 
-    # Write result JSON
     out_json = os.path.splitext(output_file)[0] + "_result.json"
     with open(out_json, "w") as f_out:
-        json.dump(geometry_data, f_out, indent=2)
+        json.dump(gd, f_out, indent=2)
 
-    print(f"[occt_projector] Result written to: {out_json}", flush=True)
+    print(f"[occt] Result written to: {out_json}", flush=True)
 
 
 if __name__ == "__main__":

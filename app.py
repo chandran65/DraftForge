@@ -108,28 +108,38 @@ selected_theme = st.sidebar.selectbox(
     help="Light: standard white paper blueprint. Dark: modern high-tech obsidian blueprint."
 )
 
+_VIEW_LABELS = {
+    "initial": "🏠  Initial (Top)",
+    "bottom":  "⬇️  Bottom",
+    "left":    "◀️  Left",
+    "right":   "▶️  Right",
+    "front":   "⬛  Front",
+    "back":    "🔁  Back",
+}
 selected_view = st.sidebar.selectbox(
-    "CAD Projection to Generate",
-    options=["top", "front", "side", "iso"],
+    "View Direction",
+    options=list(_VIEW_LABELS.keys()),
     index=0,
-    format_func=lambda v: {
-        "top":   "⬆️  Top View",
-        "front": "⬛  Front View",
-        "side":  "◀️  Right Side View",
-        "iso":   "🔷  Isometric View",
-    }[v],
-    help="Choose which orthographic or isometric projection to render on the sheet."
+    format_func=lambda v: _VIEW_LABELS[v],
+    help="Choose the orthographic projection direction.",
 )
 selected_views = [selected_view]
 
-# Subsampling density (only applicable to CAD path)
-subsample_rate = st.sidebar.slider(
-    "Wireframe Detail Index",
-    min_value=1,
-    max_value=20,
-    value=1,
-    help="Performance detail slider. 1: Full extreme 3D resolution. 20: Subsampled wireframe for lightweight rendering."
+_MODE_LABELS = {
+    "2d_wireframe":    "✏️  2D Wireframe",
+    "3d_wireframe":    "🔲  3D Wireframe",
+    "3d_hidden_lines": "〰️  3D Hidden Lines",
+    "3d_flat_shading": "🔷  3D Flat Shading",
+    "3d_smooth_shading":"🌅  3D Smooth Shading",
+}
+selected_render_mode = st.sidebar.selectbox(
+    "Render Mode",
+    options=list(_MODE_LABELS.keys()),
+    index=0,
+    format_func=lambda m: _MODE_LABELS[m],
+    help="2D Wireframe: flat edges. 3D Wireframe: depth-based edge weights. Hidden Lines: dashed back edges. Flat/Smooth Shading: filled faces with lighting.",
 )
+
 
 # Sidebar footer
 st.sidebar.markdown("---")
@@ -189,8 +199,14 @@ if uploaded_file is not None:
                     status.write("📂 Loading CAD model and discovering boundary entities...")
                     cad_exts = {".igs", ".iges", ".step", ".stp"}
                     if file_ext in cad_exts:
-                        status.write("🧬 Mathematically projecting 3D wireframes to orthographic views...")
-                        geometry_data = project_3d_cad(input_temp_path, f"{output_base}.svg", views=selected_views)
+                        mode_label = _MODE_LABELS.get(selected_render_mode, selected_render_mode)
+                        status.write(f"🧬 Projecting **{_VIEW_LABELS.get(selected_view, selected_view)}** — {mode_label}...")
+                        geometry_data = project_3d_cad(
+                            input_temp_path,
+                            f"{output_base}.svg",
+                            views=selected_views,
+                            render_mode=selected_render_mode,
+                        )
                     else:
                         status.write("🔍 Extracting 2D vectors and OpenCV blueprint paths...")
                         geometry_data = parse_drawing(input_temp_path)
